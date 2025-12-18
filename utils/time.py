@@ -1,4 +1,4 @@
-import time
+import time, pytz
 import datetime
 
 def get_timezone() -> str:
@@ -7,7 +7,10 @@ def get_timezone() -> str:
     Fallbacks to UTC if not detectable.
     """
     try:
-        tz = time.tzname[0]
+        if(time.tzname[0] == 'IST'):
+            tz = pytz.timezone("Asia/Kolkata")
+        else:
+            tz = time.tzname[0]
         if tz:
             return tz
     except Exception:

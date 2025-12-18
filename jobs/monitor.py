@@ -1,116 +1,110 @@
 # jobs/monitor.py
 
+import os
 import time
 import random
-from datetime import datetime, timezone
-from typing import List
+import logging
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Optional
 
-from rich.console import Console
-from dateutil.parser import isoparse  # 🔥 FIX
+from dateutil.parser import isoparse
 
 from instagram.fetch import fetch_reels
 from db.supabase_client import supabase
 
-console = Console()
+# ==========================
+# LOGGING
+# ==========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("monitor")
 
-def log(msg):
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}")
+# ==========================
+# SILENCE NOISY LIBRARIES
+# ==========================
+for lib in ["httpx", "httpcore", "postgrest", "supabase", "urllib3"]:
+    logging.getLogger(lib).setLevel(logging.WARNING)
 
-# ======================================================
-# CONFIG — FREE TIER SAFE
-# ======================================================
+# ==========================
+# CONFIG
+# ==========================
+DEV_MODE = os.getenv("ENV", "dev") != "prod"
 
-DEV_MODE = True               # False in production
-SNAPSHOT_RETENTION = 6        # max snapshots per reel
-MIN_VIEWS_TO_KEEP = 10
+SNAPSHOT_RETENTION = 6
 MIN_VIEWS_PER_HOUR = 5
 
-MIN_SNAPSHOT_INTERVAL_MIN = 90   # 🔥 CRITICAL
+# Snapshot rules
 MIN_VIEW_DELTA = 20
+MAX_SNAPSHOT_INTERVAL_HOURS = 6
 
-DEV_SLEEP_RANGE = (1.5, 3.0)
-PROD_SLEEP_RANGE = (8.0, 14.0)
+# 🔥 Pruning rules
+MAX_INACTIVE_DAYS = 2
+MAX_REEL_AGE_DAYS = 5
+MIN_TOTAL_VIEWS = 100
 
-# ======================================================
-# TIME HELPERS (BULLETPROOF)
-# ======================================================
+FETCH_SLEEP_RANGE = (1.5, 3.0) if DEV_MODE else (6.0, 10.0)
 
+# ==========================
+# TIME HELPERS
+# ==========================
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-
-def now_utc_iso() -> str:
-    return now_utc().isoformat()
-
-
 def parse_ts(ts: str) -> datetime:
-    """
-    Fully ISO-8601 compliant timestamp parser.
-    Handles all Supabase formats safely.
-    """
     dt = isoparse(ts)
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-
-def safe_sleep():
-    low, high = DEV_SLEEP_RANGE if DEV_MODE else PROD_SLEEP_RANGE
-    time.sleep(random.uniform(low, high))
-
-
-# ======================================================
+# ==========================
 # USERNAME NORMALIZATION
-# ======================================================
-
+# ==========================
 def normalize_usernames(rows: List[dict]) -> List[str]:
-    usernames = []
+    seen, result = set(), []
     for row in rows:
-        raw = row.get("ig_username", "")
-        for part in raw.split(","):
+        for part in row.get("ig_username", "").split(","):
             u = part.strip().lstrip("@")
-            if u:
-                usernames.append(u)
-    return list(dict.fromkeys(usernames))
+            if u and u not in seen:
+                seen.add(u)
+                result.append(u)
+    return result
 
-
-# ======================================================
-# SNAPSHOT RULES (🔥 STORAGE SAVER)
-# ======================================================
-
-def should_insert_snapshot(project_id: str, reel_url: str, reel: dict) -> bool:
-    last = (
+# ==========================
+# SNAPSHOT HELPERS
+# ==========================
+def get_snapshots(project_id: str, reel_url: str, limit=2):
+    return (
         supabase.table("reel_snapshots")
         .select("views, likes, comments, captured_at")
         .eq("project_id", project_id)
         .eq("reel_url", reel_url)
         .order("captured_at", desc=True)
-        .limit(1)
+        .limit(limit)
         .execute()
-        .data
+        .data or []
     )
 
-    if not last:
-        return True  # first snapshot
+def should_insert_snapshot(project_id: str, reel_url: str, reel: Dict) -> bool:
+    snaps = get_snapshots(project_id, reel_url, limit=1)
 
-    last = last[0]
+    if not snaps:
+        return True
 
-    mins_since = (
-        now_utc() - parse_ts(last["captured_at"])
-    ).total_seconds() / 60
-
-    if mins_since < MIN_SNAPSHOT_INTERVAL_MIN:
-        return False
+    last = snaps[0]
+    mins_since = (now_utc() - parse_ts(last["captured_at"])).total_seconds() / 60
 
     dv = reel["views"] - last["views"]
     dl = reel["likes"] - last["likes"]
     dc = reel["comments"] - last["comments"]
 
-    return dv >= MIN_VIEW_DELTA or dl > 0 or dc > 0
+    if dv >= MIN_VIEW_DELTA or dl > 0 or dc > 0:
+        return True
 
+    if mins_since >= MAX_SNAPSHOT_INTERVAL_HOURS * 60:
+        return True
 
-# ======================================================
-# SNAPSHOT MAINTENANCE
-# ======================================================
+    return False
 
 def trim_snapshots(project_id: str, reel_url: str):
     rows = (
@@ -123,89 +117,88 @@ def trim_snapshots(project_id: str, reel_url: str):
         .data or []
     )
 
-    if len(rows) <= SNAPSHOT_RETENTION:
-        return
+    if len(rows) > SNAPSHOT_RETENTION:
+        ids = [r["id"] for r in rows[SNAPSHOT_RETENTION:]]
+        supabase.table("reel_snapshots").delete().in_("id", ids).execute()
 
-    old_ids = [r["id"] for r in rows[SNAPSHOT_RETENTION:]]
-    supabase.table("reel_snapshots").delete().in_("id", old_ids).execute()
+# ==========================
+# 🔥 PRUNING LOGIC (FIX)
+# ==========================
+def should_prune_reel(project_id: str, reel: dict) -> bool:
+    reel_url = reel["reel_url"]
 
+    snaps = get_snapshots(project_id, reel_url, limit=2)
 
-def reel_is_dead(project_id: str, reel_url: str) -> bool:
-    snaps = (
-        supabase.table("reel_snapshots")
-        .select("views, captured_at")
-        .eq("project_id", project_id)
-        .eq("reel_url", reel_url)
-        .order("captured_at", desc=True)
-        .limit(2)
-        .execute()
-        .data or []
-    )
+    # Rule A — inactive for too long
+    last_seen = parse_ts(reel["last_seen_at"])
+    if now_utc() - last_seen > timedelta(days=MAX_INACTIVE_DAYS):
+        log.info("🧹 Prune: inactive too long")
+        return True
 
-    if len(snaps) < 2:
-        return False
+    # Rule B — low growth rate
+    if len(snaps) >= 2:
+        cur, prev = snaps
+        hours = max(
+            (parse_ts(cur["captured_at"]) - parse_ts(prev["captured_at"]))
+            .total_seconds() / 3600,
+            0.1,
+        )
+        vph = (cur["views"] - prev["views"]) / hours
+        if vph < MIN_VIEWS_PER_HOUR:
+            log.info("🧹 Prune: low growth rate")
+            return True
 
-    cur, prev = snaps[0], snaps[1]
+    # Rule C — old + low total views
+    age_days = (now_utc() - parse_ts(reel["last_seen_at"])).days
+    if age_days >= MAX_REEL_AGE_DAYS and reel["views"] < MIN_TOTAL_VIEWS:
+        log.info("🧹 Prune: old & underperforming")
+        return True
 
-    hours = max(
-        (parse_ts(cur["captured_at"]) - parse_ts(prev["captured_at"]))
-        .total_seconds() / 3600,
-        0.01,
-    )
+    return False
 
-    vph = (cur["views"] - prev["views"]) / hours
-
-    return cur["views"] < MIN_VIEWS_TO_KEEP and vph < MIN_VIEWS_PER_HOUR
-
-
-# ======================================================
+# ==========================
 # MAIN JOB
-# ======================================================
+# ==========================
+def run_monitor(project_id: Optional[str] = None):
+    log.info("🛰️ Monitor job started")
 
-def run_monitor():
-    console.print("\n[bold cyan]🛰️ Monitor Job Started[/bold cyan]\n")
+    query = supabase.table("projects").select("*")
+    query = query.eq("id", project_id) if project_id else query.eq("active", True)
+    projects = query.execute().data or []
 
-    projects = supabase.table("projects").select("*").execute().data or []
-
-    total_reels = 0
-    total_snapshots = 0
-    total_pruned = 0
+    total_reels = total_snaps = total_pruned = 0
 
     for project in projects:
-        project_id = project["id"]
-        console.print(f"[yellow]📁 Project:[/yellow] {project['name']}")
+        pid = project["id"]
+        log.info(f"📁 Project: {project['name']}")
 
         rows = (
             supabase.table("monitored_accounts")
             .select("ig_username")
-            .eq("project_id", project_id)
+            .eq("project_id", pid)
             .execute()
             .data or []
         )
 
         usernames = normalize_usernames(rows)
-
         if not usernames:
-            console.print("[dim]No monitored accounts[/dim]")
             continue
 
         for username in usernames:
-            log(f"🔍 Fetching @{username}")
-
             try:
+                log.info(f"🔍 Fetching {username}")
                 reels = fetch_reels(username)
-            except Exception as e:
-                console.print(f"[red]❌ Fetch failed @{username}: {e}[/red]")
+            except Exception:
+                log.exception(f"Fetch failed @{username}")
                 continue
 
             for reel in reels:
+                now = now_utc().isoformat()
                 reel_url = reel["url"]
-                now = now_utc_iso()
 
-                # 🔥 AUTHORITATIVE STATE
                 supabase.table("reels").upsert(
                     {
-                        "project_id": project_id,
+                        "project_id": pid,
                         "reel_url": reel_url,
                         "views": reel["views"],
                         "likes": reel["likes"],
@@ -217,43 +210,46 @@ def run_monitor():
 
                 total_reels += 1
 
-                # 🔥 SNAPSHOT (SMART)
-                if should_insert_snapshot(project_id, reel_url, reel):
+                if should_insert_snapshot(pid, reel_url, reel):
                     supabase.table("reel_snapshots").insert(
                         {
-                            "project_id": project_id,
+                            "project_id": pid,
                             "reel_url": reel_url,
                             "views": reel["views"],
                             "likes": reel["likes"],
                             "comments": reel["comments"],
+                            "caption": reel["caption"],
                             "captured_at": now,
                         }
                     ).execute()
-                    total_snapshots += 1
+                    total_snaps += 1
 
-                trim_snapshots(project_id, reel_url)
+                trim_snapshots(pid, reel_url)
 
-                if reel_is_dead(project_id, reel_url):
-                    console.print("[dim red]🧹 Removing dead reel[/dim red]")
-                    supabase.table("reel_snapshots").delete() \
-                        .eq("project_id", project_id) \
-                        .eq("reel_url", reel_url) \
-                        .execute()
+            time.sleep(random.uniform(*FETCH_SLEEP_RANGE))
 
-                    supabase.table("reels").delete() \
-                        .eq("project_id", project_id) \
-                        .eq("reel_url", reel_url) \
-                        .execute()
+        # 🔥 FINAL PRUNE PASS (important!)
+        all_reels = (
+            supabase.table("reels")
+            .select("*")
+            .eq("project_id", pid)
+            .execute()
+            .data or []
+        )
 
-                    total_pruned += 1
+        for r in all_reels:
+            if should_prune_reel(pid, r):
+                supabase.table("reel_snapshots").delete() \
+                    .eq("project_id", pid).eq("reel_url", r["reel_url"]).execute()
 
-            safe_sleep()
+                supabase.table("reels").delete() \
+                    .eq("project_id", pid).eq("reel_url", r["reel_url"]).execute()
 
-    log(
-        f"""
-[bold green]✅ Monitor Completed[/bold green]
-• Reels updated     : {total_reels}
-• Snapshots written : {total_snapshots}
-• Reels pruned      : {total_pruned}
-"""
+                total_pruned += 1
+
+    log.info(
+        f"✅ Monitor finished | "
+        f"Reels: {total_reels}, "
+        f"Snapshots: {total_snaps}, "
+        f"Pruned: {total_pruned}"
     )
