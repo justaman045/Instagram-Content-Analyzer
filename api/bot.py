@@ -1,5 +1,3 @@
-# api/telegram.py
-
 import os
 import re
 import json
@@ -8,12 +6,7 @@ from typing import Optional
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from db.supabase_client import supabase
 
@@ -21,7 +14,7 @@ from db.supabase_client import supabase
 # CONFIG
 # ======================================================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")  # optional but recommended
+WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
@@ -30,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("telegram-webhook")
 
 # ======================================================
-# MARKDOWN SAFETY (MarkdownV2)
+# MARKDOWN SAFETY
 # ======================================================
 def md_escape(text: str) -> str:
     if not text:
@@ -57,7 +50,7 @@ def extract_ig_username(text: str) -> Optional[str]:
     return None
 
 # ======================================================
-# SESSION HELPERS (Supabase)
+# SESSION HELPERS (SUPABASE)
 # ======================================================
 def get_session(chat_id: str):
     return (
@@ -65,7 +58,7 @@ def get_session(chat_id: str):
         .table("telegram_sessions")
         .select("*")
         .eq("chat_id", chat_id)
-        .maybe_single()   # IMPORTANT: avoids exception if not found
+        .single()
         .execute()
         .data
     )
@@ -81,9 +74,9 @@ def clear_session(chat_id: str):
     supabase.table("telegram_sessions").delete().eq("chat_id", chat_id).execute()
 
 # ======================================================
-# MESSAGE HANDLER
+# TELEGRAM HANDLER
 # ======================================================
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.text:
         return
@@ -93,10 +86,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session = get_session(chat_id)
 
-    # --------------------------------------------------
-    # STAGE: PROJECT SELECTION
-    # --------------------------------------------------
-    if session and session.get("stage") == "project":
+    # ------------------ PROJECT SELECTION ------------------
+    if session and session["stage"] == "project":
         payload = session["payload"]
         projects = payload["projects"]
 
@@ -104,10 +95,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             idx = int(text) - 1
             project = projects[idx]
         except Exception:
-            await msg.reply_text(
-                "❌ Invalid selection\\. Try again\\.",
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
+            await msg.reply_text("❌ Invalid selection.", parse_mode=ParseMode.MARKDOWN_V2)
             return
 
         ig = payload["ig"]
@@ -117,7 +105,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             .table("monitored_accounts")
             .select("id, ig_username")
             .eq("project_id", project["id"])
-            .maybe_single()
+            .single()
             .execute()
             .data
         )
@@ -130,7 +118,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             existing = [
                 u.strip()
-                for u in (row.get("ig_username") or "").split(",")
+                for u in (row["ig_username"] or "").split(",")
                 if u.strip()
             ]
             if ig not in existing:
@@ -147,46 +135,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_session(chat_id)
         return
 
-    # --------------------------------------------------
-    # NEW MESSAGE → TRY IG USERNAME
-    # --------------------------------------------------
+    # ------------------ NEW IG USER ------------------
     ig = extract_ig_username(text)
     if not ig:
         return
 
-    telegram_account = (
+    telegram_accounts = (
         supabase
         .table("telegram_accounts")
         .select("user_id")
         .eq("chat_id", chat_id)
-        .maybe_single()
         .execute()
         .data
     )
 
-    if not telegram_account:
-        await msg.reply_text(
-            "❌ Please complete setup first\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+    if not telegram_accounts:
+        await msg.reply_text("❌ Please complete setup first.")
         return
+
+    user_id = telegram_accounts[0]["user_id"]
 
     projects = (
         supabase
         .table("projects")
         .select("id,name")
-        .eq("user_id", telegram_account["user_id"])
+        .eq("user_id", user_id)
         .eq("active", True)
         .execute()
         .data
     )
-
-    if not projects:
-        await msg.reply_text(
-            "❌ No active projects found\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-        return
 
     reply = f"Choose a project for *@{md_escape(ig)}*:\n\n"
     for i, p in enumerate(projects, 1):
@@ -201,29 +178,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(reply, parse_mode=ParseMode.MARKDOWN_V2)
 
 # ======================================================
-# ERROR HANDLER
-# ======================================================
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled bot error", exc_info=context.error)
-
-# ======================================================
-# TELEGRAM APPLICATION (SINGLE, GLOBAL)
+# TELEGRAM APPLICATION (SINGLE INSTANCE)
 # ======================================================
 telegram_app = Application.builder().token(BOT_TOKEN).build()
-telegram_app.add_handler(
-    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-)
-telegram_app.add_error_handler(on_error)
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
 # ======================================================
-# VERCEL SERVERLESS ENTRYPOINT (ONLY ONE)
+# VERCEL HANDLER (ONLY ENTRY POINT)
 # ======================================================
 async def handler(request):
     # Health check
     if request.method == "GET":
         return {"statusCode": 200, "body": "OK"}
 
-    # Optional webhook secret verification
+    # Webhook secret verification
     if WEBHOOK_SECRET:
         secret = request.headers.get("x-telegram-bot-api-secret-token")
         if secret != WEBHOOK_SECRET:
