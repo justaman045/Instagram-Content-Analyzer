@@ -20,7 +20,7 @@ from db.supabase_client import supabase
 # CONFIG
 # ======================================================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")  # optional but recommended
+WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
@@ -79,7 +79,7 @@ def clear_session(chat_id: str):
     supabase.table("telegram_sessions").delete().eq("chat_id", chat_id).execute()
 
 # ======================================================
-# MESSAGE HANDLER
+# TELEGRAM MESSAGE HANDLER
 # ======================================================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -92,7 +92,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(chat_id)
 
     # --------------------------------------------------
-    # PROJECT SELECTION STAGE
+    # STAGE: PROJECT SELECTION
     # --------------------------------------------------
     if session and session.get("stage") == "project":
         payload = session["payload"]
@@ -124,6 +124,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             supabase.table("monitored_accounts").insert({
                 "project_id": project["id"],
                 "ig_username": ig,
+                "is_active": True,
             }).execute()
         else:
             existing = [
@@ -146,7 +147,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --------------------------------------------------
-    # NEW IG USERNAME
+    # NEW MESSAGE → TRY IG USERNAME
     # --------------------------------------------------
     ig = extract_ig_username(text)
     if not ig:
@@ -199,21 +200,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(reply, parse_mode=ParseMode.MARKDOWN_V2)
 
 # ======================================================
-# TELEGRAM APPLICATION (GLOBAL, SINGLE)
+# ERROR HANDLER
+# ======================================================
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled bot error", exc_info=context.error)
+
+# ======================================================
+# TELEGRAM APPLICATION (GLOBAL)
 # ======================================================
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 telegram_app.add_handler(
     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
 )
+telegram_app.add_error_handler(on_error)
 
 # ======================================================
-# FASTAPI WEB SERVICE (RENDER)
+# FASTAPI WEB SERVER (RENDER SAFE)
 # ======================================================
 app = FastAPI()
 
 @app.get("/")
 async def health():
-    return {"status": "ok"}
+    return {"status": "alive"}
 
 @app.post("/api/bot")
 async def telegram_webhook(request: Request):
@@ -225,4 +233,5 @@ async def telegram_webhook(request: Request):
     data = await request.json()
     update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
+
     return {"ok": True}
