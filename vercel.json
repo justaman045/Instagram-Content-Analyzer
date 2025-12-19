@@ -1,10 +1,4 @@
-{
-  "functions": {
-    "api/bot.py": {
-      "runtime": "@vercel/python"
-    }
-  },
-  "routes": [
+{  "routes": [
     {
       "src": "/api/bot",
       "dest": "/api/bot.py"
