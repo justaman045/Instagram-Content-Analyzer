@@ -1,6 +1,6 @@
 {
   "functions": {
-    "api/telegram.py": {
+    "api/bot.py": {
       "runtime": "python@3.10"
     }
   }
