@@ -5,8 +5,6 @@ import logging
 from typing import Optional
 
 from fastapi import FastAPI, Request, Response
-from contextlib import asynccontextmanager
-
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -31,7 +29,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("telegram-webhook")
 
 # ======================================================
-# MARKDOWN V2 SAFETY
+# MARKDOWN SAFETY
 # ======================================================
 def md_escape(text: str) -> str:
     if not text:
@@ -43,26 +41,21 @@ def md_escape(text: str) -> str:
 # ======================================================
 def extract_ig_username(text: str) -> Optional[str]:
     text = text.strip()
-
     if "instagram.com" in text:
         m = re.search(r"instagram\.com/([A-Za-z0-9_.]+)", text)
         return m.group(1) if m else None
-
     if text.startswith("@"):
         return text[1:]
-
     if re.fullmatch(r"[A-Za-z0-9_.]+", text):
         return text
-
     return None
 
 # ======================================================
-# SESSION HELPERS
+# SUPABASE SESSION HELPERS
 # ======================================================
 def get_session(chat_id: str):
     return (
-        supabase
-        .table("telegram_sessions")
+        supabase.table("telegram_sessions")
         .select("*")
         .eq("chat_id", chat_id)
         .maybe_single()
@@ -111,8 +104,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ig = payload["ig"]
 
         row = (
-            supabase
-            .table("monitored_accounts")
+            supabase.table("monitored_accounts")
             .select("id, ig_username")
             .eq("project_id", project["id"])
             .maybe_single()
@@ -124,14 +116,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             supabase.table("monitored_accounts").insert({
                 "project_id": project["id"],
                 "ig_username": ig,
-                "is_active": True,
             }).execute()
         else:
-            existing = [
-                u.strip()
-                for u in (row.get("ig_username") or "").split(",")
-                if u.strip()
-            ]
+            existing = [u.strip() for u in (row.get("ig_username") or "").split(",") if u.strip()]
             if ig not in existing:
                 existing.append(ig)
                 supabase.table("monitored_accounts").update({
@@ -146,14 +133,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_session(chat_id)
         return
 
-    # ---------------- NEW IG ----------------
+    # ---------------- NEW IG USERNAME ----------------
     ig = extract_ig_username(text)
     if not ig:
         return
 
     telegram_account = (
-        supabase
-        .table("telegram_accounts")
+        supabase.table("telegram_accounts")
         .select("user_id")
         .eq("chat_id", chat_id)
         .maybe_single()
@@ -169,8 +155,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     projects = (
-        supabase
-        .table("projects")
+        supabase.table("projects")
         .select("id,name")
         .eq("user_id", telegram_account["user_id"])
         .eq("active", True)
@@ -193,30 +178,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(reply, parse_mode=ParseMode.MARKDOWN_V2)
 
 # ======================================================
-# TELEGRAM APPLICATION
+# FASTAPI + TELEGRAM APP
 # ======================================================
-telegram_app = Application.builder().token(BOT_TOKEN).build()
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+app = FastAPI()
 
-# ======================================================
-# FASTAPI LIFESPAN (CRITICAL FIX)
-# ======================================================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+telegram_app = Application.builder().token(BOT_TOKEN).build()
+telegram_app.add_handler(
+    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+)
+
+@app.on_event("startup")
+async def startup():
     log.info("Initializing Telegram application...")
     await telegram_app.initialize()
-    yield
-    log.info("Shutting down Telegram application...")
-    await telegram_app.shutdown()
-
-app = FastAPI(lifespan=lifespan)
-
-# ======================================================
-# ROUTES
-# ======================================================
-@app.get("/")
-async def health():
-    return {"status": "alive"}
 
 @app.post("/api/bot")
 async def telegram_webhook(request: Request):
@@ -228,4 +202,8 @@ async def telegram_webhook(request: Request):
     data = await request.json()
     update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
-    return {"ok": True}
+    return Response(status_code=200)
+
+@app.get("/")
+async def health():
+    return {"status": "alive"}
