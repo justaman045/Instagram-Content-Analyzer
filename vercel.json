@@ -1,7 +1,7 @@
 {
   "functions": {
     "api/bot.py": {
-      "runtime": "python"
+      "runtime": "python@3.10"
     }
   },
   "routes": [
