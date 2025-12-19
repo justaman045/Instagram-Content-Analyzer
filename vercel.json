@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/telegram.py": {
+      "runtime": "python3.10"
+    }
+  }
+}
