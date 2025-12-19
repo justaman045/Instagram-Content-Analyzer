@@ -16,6 +16,8 @@ from db.supabase_client import supabase
 # CONFIG
 # ==========================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")  # OPTIONAL BUT RECOMMENDED
+
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
 
@@ -78,14 +80,17 @@ def clear_session(chat_id: str):
 # ==========================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
+    if not msg or not msg.text:
+        return
+
     chat_id = str(msg.chat.id)
-    text = (msg.text or "").strip()
+    text = msg.text.strip()
 
     session = get_session(chat_id)
 
-    # ======================================================
-    # STAGE: PROJECT SELECTION
-    # ======================================================
+    # -------------------------
+    # PROJECT SELECTION
+    # -------------------------
     if session and session["stage"] == "project":
         payload = session["payload"]
         projects = payload["projects"]
@@ -98,8 +103,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         ig = payload["ig"]
-        safe_ig = md_escape(ig)
-        safe_project = md_escape(project["name"])
 
         row = (
             supabase
@@ -125,16 +128,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 }).eq("id", row["id"]).execute()
 
         await msg.reply_text(
-            f"✅ *@{safe_ig}* added to *{safe_project}*",
+            f"✅ *@{md_escape(ig)}* added to *{md_escape(project['name'])}*",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
 
         clear_session(chat_id)
         return
 
-    # ======================================================
-    # NEW MESSAGE → IG USERNAME
-    # ======================================================
+    # -------------------------
+    # NEW IG USERNAME
+    # -------------------------
     ig = extract_ig_username(text)
     if not ig:
         return
@@ -164,10 +167,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         .data
     )
 
-    if not projects:
-        await msg.reply_text("❌ No active projects found.")
-        return
-
     reply = f"Choose a project for *@{md_escape(ig)}*:\n\n"
     for i, p in enumerate(projects, 1):
         reply += f"{i}\\. {md_escape(p['name'])}\n"
@@ -182,14 +181,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(reply, parse_mode=ParseMode.MARKDOWN_V2)
 
 # ==========================
-# VERCEL HANDLER
+# ERROR HANDLER
+# ==========================
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled error", exc_info=context.error)
+
+# ==========================
+# VERCEL APP
 # ==========================
 app = Application.builder().token(BOT_TOKEN).build()
-app.add_handler(
-    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-)
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+app.add_error_handler(on_error)
 
+# ==========================
+# VERCEL HANDLER
+# ==========================
 async def handler(request):
+    # Allow GET (health check)
+    if request.method == "GET":
+        return {"statusCode": 200, "body": "OK"}
+
+    # Optional webhook secret verification
+    if WEBHOOK_SECRET:
+        secret = request.headers.get("x-telegram-bot-api-secret-token")
+        if secret != WEBHOOK_SECRET:
+            return {"statusCode": 403}
+
     body = await request.body()
     update = Update.de_json(json.loads(body), app.bot)
     await app.process_update(update)
