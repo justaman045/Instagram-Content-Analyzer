@@ -1,3 +1,5 @@
+# api/bot.py
+
 import os
 import re
 import json
@@ -18,8 +20,8 @@ from db.supabase_client import supabase
 # ======================================================
 # CONFIG
 # ======================================================
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")  # optional but recommended
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")  # optional but recommended
 
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
@@ -28,13 +30,12 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("telegram-webhook")
 
 # ======================================================
-# MARKDOWN V2 SAFETY
+# MARKDOWN SAFETY (MarkdownV2)
 # ======================================================
 def md_escape(text: str) -> str:
     if not text:
         return ""
-    escape_chars = r"\_*[]()~`>#+-=|{}.!"
-    return "".join("\\" + c if c in escape_chars else c for c in text)
+    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", text)
 
 # ======================================================
 # HELPERS
@@ -63,7 +64,7 @@ def get_session(chat_id: str):
         .table("telegram_sessions")
         .select("*")
         .eq("chat_id", chat_id)
-        .maybe_single()   # SAFE: no crash if not found
+        .maybe_single()     # IMPORTANT
         .execute()
         .data
     )
@@ -92,7 +93,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(chat_id)
 
     # --------------------------------------------------
-    # STAGE 2 — PROJECT SELECTION
+    # STAGE: PROJECT SELECTION
     # --------------------------------------------------
     if session and session.get("stage") == "project":
         payload = session["payload"]
@@ -146,7 +147,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --------------------------------------------------
-    # STAGE 1 — NEW IG USERNAME
+    # NEW MESSAGE → TRY IG USERNAME
     # --------------------------------------------------
     ig = extract_ig_username(text)
     if not ig:
@@ -202,10 +203,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ERROR HANDLER
 # ======================================================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled Telegram bot error", exc_info=context.error)
+    log.exception("Unhandled bot error", exc_info=context.error)
 
 # ======================================================
-# TELEGRAM APPLICATION (SINGLE GLOBAL INSTANCE)
+# SINGLE TELEGRAM APPLICATION (GLOBAL)
 # ======================================================
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 telegram_app.add_handler(
@@ -221,7 +222,7 @@ async def handler(request):
     if request.method == "GET":
         return {"statusCode": 200, "body": "OK"}
 
-    # Webhook secret verification
+    # Optional webhook secret validation
     if WEBHOOK_SECRET:
         secret = request.headers.get("x-telegram-bot-api-secret-token")
         if secret != WEBHOOK_SECRET:
