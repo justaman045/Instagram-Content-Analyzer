@@ -4,11 +4,16 @@ import os
 import re
 import json
 import logging
-from typing import Optional, List
+from typing import Optional
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from db.supabase_client import supabase
 
@@ -16,7 +21,7 @@ from db.supabase_client import supabase
 # CONFIG
 # ==========================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")  # OPTIONAL BUT RECOMMENDED
+WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
@@ -76,7 +81,7 @@ def clear_session(chat_id: str):
     supabase.table("telegram_sessions").delete().eq("chat_id", chat_id).execute()
 
 # ==========================
-# MAIN HANDLER
+# MESSAGE HANDLER
 # ==========================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -187,27 +192,30 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error", exc_info=context.error)
 
 # ==========================
-# VERCEL APP
+# TELEGRAM APPLICATION (SINGLE INSTANCE)
 # ==========================
-app = Application.builder().token(BOT_TOKEN).build()
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-app.add_error_handler(on_error)
+telegram_app = Application.builder().token(BOT_TOKEN).build()
+telegram_app.add_handler(
+    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+)
+telegram_app.add_error_handler(on_error)
 
 # ==========================
-# VERCEL HANDLER
+# VERCEL HANDLER (ONLY ENTRY POINT)
 # ==========================
 async def handler(request):
-    # Allow GET (health check)
+    # Health check
     if request.method == "GET":
         return {"statusCode": 200, "body": "OK"}
 
-    # Optional webhook secret verification
+    # Webhook secret verification
     if WEBHOOK_SECRET:
         secret = request.headers.get("x-telegram-bot-api-secret-token")
         if secret != WEBHOOK_SECRET:
             return {"statusCode": 403}
 
     body = await request.body()
-    update = Update.de_json(json.loads(body), app.bot)
-    await app.process_update(update)
+    update = Update.de_json(json.loads(body), telegram_app.bot)
+    await telegram_app.process_update(update)
+
     return {"statusCode": 200}
