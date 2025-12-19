@@ -5,6 +5,8 @@ import logging
 from typing import Optional
 
 from fastapi import FastAPI, Request, Response
+from contextlib import asynccontextmanager
+
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -55,7 +57,7 @@ def extract_ig_username(text: str) -> Optional[str]:
     return None
 
 # ======================================================
-# SESSION HELPERS (SUPABASE)
+# SESSION HELPERS
 # ======================================================
 def get_session(chat_id: str):
     return (
@@ -79,7 +81,7 @@ def clear_session(chat_id: str):
     supabase.table("telegram_sessions").delete().eq("chat_id", chat_id).execute()
 
 # ======================================================
-# TELEGRAM MESSAGE HANDLER
+# TELEGRAM HANDLER
 # ======================================================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -91,9 +93,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session = get_session(chat_id)
 
-    # --------------------------------------------------
-    # STAGE: PROJECT SELECTION
-    # --------------------------------------------------
+    # ---------------- PROJECT SELECTION ----------------
     if session and session.get("stage") == "project":
         payload = session["payload"]
         projects = payload["projects"]
@@ -146,9 +146,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_session(chat_id)
         return
 
-    # --------------------------------------------------
-    # NEW MESSAGE → TRY IG USERNAME
-    # --------------------------------------------------
+    # ---------------- NEW IG ----------------
     ig = extract_ig_username(text)
     if not ig:
         return
@@ -191,34 +189,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, p in enumerate(projects, 1):
         reply += f"{i}\\. {md_escape(p['name'])}\n"
 
-    save_session(
-        chat_id,
-        stage="project",
-        payload={"ig": ig, "projects": projects},
-    )
-
+    save_session(chat_id, "project", {"ig": ig, "projects": projects})
     await msg.reply_text(reply, parse_mode=ParseMode.MARKDOWN_V2)
 
 # ======================================================
-# ERROR HANDLER
-# ======================================================
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled bot error", exc_info=context.error)
-
-# ======================================================
-# TELEGRAM APPLICATION (GLOBAL)
+# TELEGRAM APPLICATION
 # ======================================================
 telegram_app = Application.builder().token(BOT_TOKEN).build()
-telegram_app.add_handler(
-    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-)
-telegram_app.add_error_handler(on_error)
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 # ======================================================
-# FASTAPI WEB SERVER (RENDER SAFE)
+# FASTAPI LIFESPAN (CRITICAL FIX)
 # ======================================================
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("Initializing Telegram application...")
+    await telegram_app.initialize()
+    yield
+    log.info("Shutting down Telegram application...")
+    await telegram_app.shutdown()
 
+app = FastAPI(lifespan=lifespan)
+
+# ======================================================
+# ROUTES
+# ======================================================
 @app.get("/")
 async def health():
     return {"status": "alive"}
@@ -233,5 +228,4 @@ async def telegram_webhook(request: Request):
     data = await request.json()
     update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
-
     return {"ok": True}
