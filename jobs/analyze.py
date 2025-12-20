@@ -68,7 +68,7 @@ def run_analyze(
     project_id: Optional[str] = None,
 ):
     log.info("📊 Analyze job started")
-    console.print("[bold cyan]📊 Analyze Job – Momentum Engine[/bold cyan]\n")
+    log.info("[bold cyan]📊 Analyze Job – Momentum Engine[/bold cyan]\n")
 
     # -------------------------
     # Fetch projects
@@ -88,7 +88,7 @@ def run_analyze(
         pid = project["id"]
         pname = project["name"]
 
-        console.print(
+        log.info(
             f"\n[bold underline]📁 Project: {pname}[/bold underline]"
         )
 
@@ -153,7 +153,7 @@ def run_analyze(
                 )
 
             if not ranked:
-                console.print("[dim]No analyzable reels[/dim]")
+                log.info("[dim]No analyzable reels[/dim]")
                 continue
 
             ranked.sort(key=lambda x: x["score"], reverse=True)
@@ -186,7 +186,7 @@ def run_analyze(
                         r["trend"],
                     )
 
-                console.print(table)
+                log.info(table)
                 continue
 
             # =========================
@@ -211,11 +211,11 @@ def run_analyze(
                 "reel_url", best["url"]
             ).execute()
 
-            console.print(
+            log.info(
                 f"[green]⭐ Recommended[/green] {best['url']} ({best['trend']})"
             )
 
         except Exception:
             log.exception(f"Analyze failed for project: {pname}")
 
-    console.print("\n[bold green]✅ Analyze job finished[/bold green]")
+    log.info("\n[bold green]✅ Analyze job finished[/bold green]")

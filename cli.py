@@ -55,6 +55,7 @@ def prompt_project_selection(projects: List[Dict]) -> str:
 
     for idx, p in enumerate(projects, start=1):
         print(f"{idx}. {p['name']}")
+        # print(f"{idx}. {p['id']}")
 
     while True:
         choice = input("\nEnter project number: ").strip()
@@ -109,7 +110,12 @@ def main() -> int:
 
 
     # ---- deliver ----
-    sub.add_parser("deliver", help="Run delivery job")
+    deliver = sub.add_parser("deliver", help="Run delivery job")
+    deliver.add_argument(
+        "--project",
+        type=int,
+        help="Project number (use list order)"
+    )
 
     args = parser.parse_args()
 
@@ -166,7 +172,16 @@ def main() -> int:
 
 
         elif args.command == "deliver":
-            run_deliver()
+            projects = list_projects()
+            if args.project:
+                idx = args.project - 1
+                if idx < 0 or idx >= len(projects):
+                    raise ValueError("Invalid project number")
+
+                project_id = projects[idx]["id"]
+                run_deliver(project_id=project_id)
+            else:
+                run_deliver()
 
         return 0
 

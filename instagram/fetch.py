@@ -3,6 +3,28 @@ import random
 import requests
 import threading
 from instagram.parse import parse_reels_from_json
+import logging
+
+# ==========================
+# LOGGING
+# ==========================
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("cli")
+
+
+# ==========================
+# SILENCE NOISY LIBRARIES
+# ==========================
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("postgrest").setLevel(logging.WARNING)
+logging.getLogger("supabase").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+
 
 # ==========================
 # GLOBAL RATE LIMITER
@@ -23,7 +45,7 @@ def rate_limit():
 
         if len(_request_times) >= MAX_REQUESTS_PER_HOUR:
             sleep_for = SECONDS_PER_HOUR - (now - _request_times[0]) + random.uniform(5, 15)
-            print(f"⏳ Rate limit reached, sleeping {sleep_for:.1f}s")
+            log.info(f"⏳ Rate limit reached, sleeping {sleep_for:.1f}s")
             time.sleep(sleep_for)
 
         _request_times.append(time.time())
@@ -64,32 +86,32 @@ def fetch_reels(username: str):
     try:
         res = SESSION.get(url, headers=HEADERS, timeout=10)
     except requests.RequestException:
-        print(f"⚠️ Network error @{username}")
+        log.info(f"⚠️ Network error @{username}")
         return []
 
     # --------------------------
     # HARD FAIL CONDITIONS
     # --------------------------
     if res.status_code in (401, 403, 429):
-        print(f"🚫 BLOCKED by Instagram ({res.status_code}). Cooling down.")
+        log.info(f"🚫 BLOCKED by Instagram ({res.status_code}). Cooling down.")
         time.sleep(random.uniform(900, 1800))  # 15–30 min
         return []
 
     if res.status_code != 200:
-        print(f"⚠️ Failed @{username} ({res.status_code})")
+        log.info(f"⚠️ Failed @{username} ({res.status_code})")
         return []
 
     try:
         data = res.json()
     except Exception:
-        print("⚠️ Invalid JSON — likely soft block")
+        log.info("⚠️ Invalid JSON — likely soft block")
         time.sleep(random.uniform(300, 600))
         return []
 
     # Random idle pause AFTER successful fetch
     if random.random() < 0.12:
-        idle = random.uniform(20, 60)
-        print(f"😴 Idle pause {idle:.1f}s")
-        time.sleep(idle)
+        idle = random.uniform(2, 6)
+        log.info(f"😴 Idle pause {idle:.1f}s")
+        time.sleep(idle * 60)
 
     return parse_reels_from_json(data)
