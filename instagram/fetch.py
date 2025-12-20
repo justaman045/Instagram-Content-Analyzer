@@ -6,10 +6,20 @@ from instagram.parse import parse_reels_from_json
 import logging
 
 # ==========================
+# Request Blocking Helpers
+# ==========================
+_response_blocked = False
+_block_lock = threading.Lock()
+
+def is_blocked() -> bool:
+    with _block_lock:
+        return _response_blocked
+
+# ==========================
 # LOGGING
 # ==========================
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -73,9 +83,14 @@ HEADERS = {
 # FETCH
 # ==========================
 def fetch_reels(username: str):
-    rate_limit()
+    global _response_blocked
 
-    # Human-like jitter BEFORE request
+    # 🚫 If already blocked, do NOTHING
+    with _block_lock:
+        if _response_blocked:
+            return None  # important: None means "skipped"
+
+    rate_limit()
     time.sleep(random.uniform(1.2, 3.8))
 
     url = (
@@ -86,32 +101,28 @@ def fetch_reels(username: str):
     try:
         res = SESSION.get(url, headers=HEADERS, timeout=10)
     except requests.RequestException:
-        log.info(f"⚠️ Network error @{username}")
+        log.warning(f"⚠️ Network error @{username}")
         return []
 
-    # --------------------------
-    # HARD FAIL CONDITIONS
-    # --------------------------
+    # 🚨 FIRST HARD BLOCK
     if res.status_code in (401, 403, 429):
-        log.info(f"🚫 BLOCKED by Instagram ({res.status_code}). Cooling down.")
-        time.sleep(random.uniform(900, 1800))  # 15–30 min
-        return []
+        with _block_lock:
+            _response_blocked = True
+
+        log.error(
+            f"🚫 BLOCKED by Instagram ({res.status_code}) "
+            f"@{username} — future requests will be skipped"
+        )
+        return None
 
     if res.status_code != 200:
-        log.info(f"⚠️ Failed @{username} ({res.status_code})")
+        log.warning(f"⚠️ Failed @{username} ({res.status_code})")
         return []
 
     try:
         data = res.json()
     except Exception:
-        log.info("⚠️ Invalid JSON — likely soft block")
-        time.sleep(random.uniform(300, 600))
+        log.warning("⚠️ Invalid JSON — possible soft block")
         return []
-
-    # Random idle pause AFTER successful fetch
-    if random.random() < 0.12:
-        idle = random.uniform(2, 6)
-        log.info(f"😴 Idle pause {idle:.1f}s")
-        time.sleep(idle * 60)
 
     return parse_reels_from_json(data)

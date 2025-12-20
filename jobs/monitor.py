@@ -6,10 +6,9 @@ import random
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional
-
 from dateutil.parser import isoparse
 
-from instagram.fetch import fetch_reels
+from instagram.fetch import fetch_reels, is_blocked
 from db.supabase_client import supabase
 
 # ======================================================
@@ -197,8 +196,17 @@ def run_monitor(project_id: Optional[str] = None):
             try:
                 log.info(f"🔍 Fetching {username}")
                 reels = fetch_reels(username)
+
+                # 🚫 Skipped due to Instagram block
+                if reels is None:
+                    log.warning(
+                        f"⏭️ skipped @{username} due to response being blocked by Instagram"
+                    )
+                    continue
+
                 requests_this_run += 1
                 batch_count += 1
+
             except Exception:
                 log.exception(f"Fetch failed @{username}")
                 continue
@@ -243,6 +251,10 @@ def run_monitor(project_id: Optional[str] = None):
                 log.info(f"😴 Batch cooldown {cooldown:.0f}s")
                 time.sleep(cooldown)
                 batch_count = 0
+        
+        if is_blocked():
+            log.error("🚫 Instagram blocked — stopping monitor run safely")
+            return
 
         # 🔥 FINAL PRUNE PASS
         all_reels = (

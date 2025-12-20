@@ -238,6 +238,6 @@ def run_deliver(project_id: Optional[str] = None) -> int:
         ).execute()
 
         delivered_count += 1
-        print(f"[green]✅ Delivered[/green] {reel['reel_url']}")
+        log.info(f"[green]✅ Delivered[/green] {reel['reel_url']}")
 
     return delivered_count

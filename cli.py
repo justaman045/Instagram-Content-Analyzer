@@ -13,7 +13,7 @@ from setup.setup import run_setup   # 👈 ADD THIS
 # LOGGING
 # ==========================
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
