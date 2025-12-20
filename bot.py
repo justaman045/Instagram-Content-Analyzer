@@ -3,7 +3,7 @@
 import os
 import re
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from telegram import Update
 from telegram.ext import (
@@ -35,9 +35,22 @@ if not BOT_TOKEN:
 PENDING: Dict[str, dict] = {}
 
 # ==========================
+# MARKDOWN SAFETY
+# ==========================
+def md_escape(text: str) -> str:
+    """
+    Escape text for Telegram MarkdownV2
+    """
+    if not text:
+        return ""
+    escape_chars = r"\_*[]()~`>#+-=|{}.!"
+    return "".join("\\" + c if c in escape_chars else c for c in text)
+
+
+# ==========================
 # HELPERS
 # ==========================
-def extract_ig_username(text: str) -> str | None:
+def extract_ig_username(text: str) -> Optional[str]:
     text = text.strip()
 
     if "instagram.com" in text:
@@ -54,10 +67,13 @@ def extract_ig_username(text: str) -> str | None:
 
 
 async def reply_project_list(message, ig: str, projects: List[dict]):
-    reply = f"Which project do you want to add @{ig} to?\n\n"
+    safe_ig = md_escape(ig)
+
+    reply = f"Which project do you want to add *@{safe_ig}* to?\n\n"
     for i, p in enumerate(projects, 1):
-        reply += f"{i}. {p['name']}\n"
-    await message.reply_text(reply)
+        reply += f"{i}\\. {md_escape(p['name'])}\n"
+
+    await message.reply_text(reply, parse_mode="MarkdownV2")
 
 
 # ==========================
@@ -66,7 +82,7 @@ async def reply_project_list(message, ig: str, projects: List[dict]):
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     telegram_user_id = str(msg.from_user.id)
-    text = msg.text.strip()
+    text = (msg.text or "").strip()
 
     # ======================================================
     # STAGE 1 — ACCOUNT SELECTION
@@ -78,7 +94,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             idx = int(text) - 1
             selected = state["accounts"][idx]
         except Exception:
-            await msg.reply_text("❌ Invalid selection. Try again.")
+            await msg.reply_text("❌ Invalid selection\\. Try again\\.", parse_mode="MarkdownV2")
             return
 
         state["user_id"] = selected["user_id"]
@@ -98,14 +114,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             idx = int(text) - 1
             project = state["projects"][idx]
         except Exception:
-            await msg.reply_text("❌ Invalid selection. Try again.")
+            await msg.reply_text("❌ Invalid selection\\. Try again\\.", parse_mode="MarkdownV2")
             return
 
         ig = state["ig_username"]
+        safe_ig = md_escape(ig)
+        safe_project = md_escape(project["name"])
 
-        # ---------------------------------------------
-        # FETCH EXISTING MONITORED_ACCOUNTS ROW
-        # ---------------------------------------------
         row = (
             supabase
             .table("monitored_accounts")
@@ -116,9 +131,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             .data
         )
 
-        # ---------------------------------------------
-        # NO ROW → CREATE
-        # ---------------------------------------------
         if not row:
             supabase.table("monitored_accounts").insert({
                 "project_id": project["id"],
@@ -127,13 +139,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }).execute()
 
             await msg.reply_text(
-                f"✅ @{ig} added to *{project['name']}*",
-                parse_mode="Markdown",
+                f"✅ *@{safe_ig}* added to *{safe_project}*",
+                parse_mode="MarkdownV2",
             )
 
-        # ---------------------------------------------
-        # ROW EXISTS → APPEND
-        # ---------------------------------------------
         else:
             existing = [
                 u.strip()
@@ -143,20 +152,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if ig in existing:
                 await msg.reply_text(
-                    f"⚠️ @{ig} already exists in *{project['name']}*",
-                    parse_mode="Markdown",
+                    f"⚠️ *@{safe_ig}* already exists in *{safe_project}*",
+                    parse_mode="MarkdownV2",
                 )
             else:
                 existing.append(ig)
-                updated = ", ".join(existing)
-
                 supabase.table("monitored_accounts").update({
-                    "ig_username": updated
+                    "ig_username": ", ".join(existing)
                 }).eq("id", row["id"]).execute()
 
                 await msg.reply_text(
-                    f"✅ @{ig} added to *{project['name']}*",
-                    parse_mode="Markdown",
+                    f"✅ *@{safe_ig}* added to *{safe_project}*",
+                    parse_mode="MarkdownV2",
                 )
 
         del PENDING[telegram_user_id]
@@ -169,9 +176,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ig_username:
         return
 
-    # ------------------------------------------------------
-    # Resolve Telegram → Supabase users
-    # ------------------------------------------------------
     telegram_accounts = (
         supabase
         .table("telegram_accounts")
@@ -182,12 +186,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if not telegram_accounts:
-        await msg.reply_text("❌ Please complete setup first.")
+        await msg.reply_text("❌ Please complete setup first\\.", parse_mode="MarkdownV2")
         return
 
-    # ------------------------------------------------------
-    # Build labeled accounts
-    # ------------------------------------------------------
     accounts = []
 
     for row in telegram_accounts:
@@ -205,7 +206,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
         dest = projects[0].get("destination_instagram") or "unknown"
-        label = f"@{dest} ({len(projects)} project{'s' if len(projects) > 1 else ''})"
+        label = f"@{md_escape(dest)} \\({len(projects)} project{'s' if len(projects) > 1 else ''}\\)"
 
         accounts.append({
             "user_id": row["user_id"],
@@ -214,7 +215,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
 
     if not accounts:
-        await msg.reply_text("❌ No active projects found.")
+        await msg.reply_text("❌ No active projects found\\.", parse_mode="MarkdownV2")
         return
 
     # ======================================================
@@ -227,11 +228,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "stage": "user",
         }
 
-        reply = f"Multiple accounts found.\nWhich account should manage @{ig_username}?\n\n"
+        reply = "Multiple accounts found\\. Choose one:\n\n"
         for i, acc in enumerate(accounts, 1):
-            reply += f"{i}. {acc['label']}\n"
+            reply += f"{i}\\. {acc['label']}\n"
 
-        await msg.reply_text(reply)
+        await msg.reply_text(reply, parse_mode="MarkdownV2")
         return
 
     # ======================================================
@@ -239,7 +240,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ======================================================
     PENDING[telegram_user_id] = {
         "ig_username": ig_username,
-        "user_id": accounts[0]["user_id"],
         "projects": accounts[0]["projects"],
         "stage": "project",
     }
@@ -248,11 +248,20 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==========================
+# ERROR HANDLER (IMPORTANT)
+# ==========================
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled exception in bot", exc_info=context.error)
+
+
+# ==========================
 # START BOT
 # ==========================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT, on_message))
+    app.add_error_handler(on_error)
+
     log.info("🤖 Telegram bot started")
     app.run_polling()
 
