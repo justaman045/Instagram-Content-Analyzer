@@ -11,6 +11,7 @@ from dateutil.parser import isoparse
 
 from db.supabase_client import supabase
 
+
 # ==========================
 # LOGGING
 # ==========================
@@ -186,7 +187,7 @@ def run_analyze(
                         r["trend"],
                     )
 
-                log.info(table)
+                print(table)
                 continue
 
             # =========================
@@ -194,22 +195,35 @@ def run_analyze(
             # =========================
             best = ranked[0]
 
-            supabase.table("reels").update(
-                {"is_recommended": False}
-            ).eq("project_id", pid).execute()
+            with supabase.client.session() as session:
+                session.execute(
+                    "BEGIN"
+                )
+                try:
+                    session.execute(
+                        "UPDATE reels SET is_recommended = False WHERE project_id = :pid",
+                        {"pid": pid}
+                    )
 
-            supabase.table("reels").update(
-                {
-                    "score": best["score"],
-                    "trend": best["trend"],
-                    "is_recommended": True,
-                    "analyzed_at": datetime.now(
-                        timezone.utc
-                    ).isoformat(),
-                }
-            ).eq("project_id", pid).eq(
-                "reel_url", best["url"]
-            ).execute()
+                    session.execute(
+                        "UPDATE reels SET score = :score, trend = :trend, is_recommended = True, analyzed_at = :analyzed_at WHERE project_id = :pid AND reel_url = :url",
+                        {
+                            "score": best["score"],
+                            "trend": best["trend"],
+                            "analyzed_at": datetime.now(timezone.utc).isoformat(),
+                            "pid": pid,
+                            "url": best["url"]
+                        }
+                    )
+
+                    session.execute(
+                        "COMMIT"
+                    )
+                except Exception as e:
+                    session.execute(
+                        "ROLLBACK"
+                    )
+                    raise
 
             log.info(
                 f"[green]⭐ Recommended[/green] {best['url']} ({best['trend']})"

@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import sys
 from typing import List, Dict
 
@@ -8,6 +9,7 @@ from jobs.monitor import run_monitor
 from jobs.analyze import run_analyze
 from jobs.deliver import run_deliver
 from setup.setup import run_setup   # 👈 ADD THIS
+
 
 # ==========================
 # LOGGING
@@ -18,6 +20,11 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("cli")
+
+handler = logging.FileHandler("app.log")
+formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+handler.setFormatter(formatter)
+log.addHandler(handler)
 
 
 # ==========================
@@ -55,10 +62,12 @@ def prompt_project_selection(projects: List[Dict]) -> str:
 
     for idx, p in enumerate(projects, start=1):
         print(f"{idx}. {p['name']}")
-        # print(f"{idx}. {p['id']}")
 
     while True:
-        choice = input("\nEnter project number: ").strip()
+        choice = input("\nEnter project number (or 'q' to quit): ").strip().lower()
+
+        if choice == "q":
+            sys.exit(0)
 
         try:
             idx = int(choice)
@@ -68,7 +77,6 @@ def prompt_project_selection(projects: List[Dict]) -> str:
             pass
 
         print("❌ Invalid selection, try again.")
-
 
 
 # ==========================
@@ -108,7 +116,6 @@ def main() -> int:
         help="Project number (use list order)"
     )
 
-
     # ---- deliver ----
     deliver = sub.add_parser("deliver", help="Run delivery job")
     deliver.add_argument(
@@ -122,46 +129,36 @@ def main() -> int:
     try:
         if args.command == "setup":
             run_setup()
-
         elif args.command == "monitor":
             projects = list_projects()
 
+            project_id = None
             if args.project:
                 idx = args.project - 1
                 if idx < 0 or idx >= len(projects):
                     raise ValueError("Invalid project number")
-
                 project_id = projects[idx]["id"]
-
             else:
                 if len(projects) == 1:
                     project_id = projects[0]["id"]
-                    log.info(
-                        f"Only one project found, running: {projects[0]['name']}"
-                    )
+                    log.info(f"Only one project found, running: {projects[0]['name']}")
                 else:
                     project_id = prompt_project_selection(projects)
 
             run_monitor(project_id=project_id)
-
         elif args.command == "analyze":
             projects = list_projects()
 
-            # ---- explicit project ----
+            project_id = None
             if args.project:
                 idx = args.project - 1
                 if idx < 0 or idx >= len(projects):
                     raise ValueError("Invalid project number")
-
                 project_id = projects[idx]["id"]
-
-            # ---- interactive selection ----
             else:
                 if len(projects) == 1:
                     project_id = projects[0]["id"]
-                    log.info(
-                        f"Only one project found, analyzing: {projects[0]['name']}"
-                    )
+                    log.info(f"Only one project found, analyzing: {projects[0]['name']}")
                 else:
                     project_id = prompt_project_selection(projects)
 
@@ -169,15 +166,12 @@ def main() -> int:
                 preview=args.inspect,
                 project_id=project_id
             )
-
-
         elif args.command == "deliver":
             projects = list_projects()
             if args.project:
                 idx = args.project - 1
                 if idx < 0 or idx >= len(projects):
                     raise ValueError("Invalid project number")
-
                 project_id = projects[idx]["id"]
                 run_deliver(project_id=project_id)
             else:
@@ -188,9 +182,8 @@ def main() -> int:
     except KeyboardInterrupt:
         log.warning("Interrupted by user")
         return 130
-
-    except Exception:
-        log.exception("❌ Job failed")
+    except Exception as e:
+        log.error(f"❌ Job failed: {e}")
         return 1
 
 
