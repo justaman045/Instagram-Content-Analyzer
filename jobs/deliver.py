@@ -14,7 +14,7 @@ from tgram.send import send_message
 # ==========================
 # CONFIG
 # ==========================
-DEV_MODE = True  # set True only for local testing
+DEV_MODE = False  # set True only for local testing
 
 # ==========================
 # LOGGING
