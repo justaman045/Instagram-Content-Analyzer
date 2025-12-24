@@ -21,7 +21,6 @@ from db.supabase_client import supabase
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("telegram-bot")
 
-# Silence noisy libraries
 for lib in ("httpx", "httpcore", "postgrest", "supabase", "urllib3"):
     logging.getLogger(lib).setLevel(logging.WARNING)
 
@@ -35,17 +34,12 @@ if not BOT_TOKEN:
 PENDING: Dict[str, dict] = {}
 
 # ==========================
-# MARKDOWN SAFETY
+# MARKDOWN SAFETY (Telegram MarkdownV2)
 # ==========================
 def md_escape(text: str) -> str:
-    """
-    Escape text for Telegram MarkdownV2
-    """
     if not text:
         return ""
-    escape_chars = r"\_*[]()~`>#+-=|{}.!"
-    return "".join("\\" + c if c in escape_chars else c for c in text)
-
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
 
 # ==========================
 # HELPERS
@@ -66,15 +60,11 @@ def extract_ig_username(text: str) -> Optional[str]:
     return None
 
 
-async def reply_project_list(message, ig: str, projects: List[dict]):
-    safe_ig = md_escape(ig)
-
-    reply = f"Which project do you want to add *@{safe_ig}* to?\n\n"
+async def reply_project_list(msg, title: str, projects: List[dict]):
+    reply = f"{title}\n\n"
     for i, p in enumerate(projects, 1):
         reply += f"{i}\\. {md_escape(p['name'])}\n"
-
-    await message.reply_text(reply, parse_mode="MarkdownV2")
-
+    await msg.reply_text(reply, parse_mode="MarkdownV2")
 
 # ==========================
 # MAIN HANDLER
@@ -84,46 +74,70 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_user_id = str(msg.from_user.id)
     text = (msg.text or "").strip()
 
-    # ======================================================
-    # STAGE 1 — ACCOUNT SELECTION
-    # ======================================================
-    if telegram_user_id in PENDING and PENDING[telegram_user_id]["stage"] == "user":
-        state = PENDING[telegram_user_id]
-
-        try:
-            idx = int(text) - 1
-            selected = state["accounts"][idx]
-        except Exception:
-            await msg.reply_text("❌ Invalid selection\\. Try again\\.", parse_mode="MarkdownV2")
-            return
-
-        state["user_id"] = selected["user_id"]
-        state["projects"] = selected["projects"]
-        state["stage"] = "project"
-
-        await reply_project_list(msg, state["ig_username"], selected["projects"])
+    # ==========================
+    # COMMANDS
+    # ==========================
+    if text == "/list":
+        await handle_list(msg, telegram_user_id)
         return
 
-    # ======================================================
-    # STAGE 2 — PROJECT SELECTION
-    # ======================================================
-    if telegram_user_id in PENDING and PENDING[telegram_user_id]["stage"] == "project":
-        state = PENDING[telegram_user_id]
+    if text == "/remove":
+        await handle_remove_start(msg, telegram_user_id)
+        return
 
+    if text == "/cancel":
+        PENDING.pop(telegram_user_id, None)
+        await msg.reply_text("✅ Cancelled", parse_mode="MarkdownV2")
+        return
+    
+    if text in ("/stop", "/cancel"):
+        PENDING.pop(telegram_user_id, None)
+        await msg.reply_text(
+            "🛑 Current action stopped\\. You can start again\\.",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+
+    # ==========================
+    # ADD FLOW — ACCOUNT PICK
+    # ==========================
+    if telegram_user_id in PENDING and PENDING[telegram_user_id]["stage"] == "add_user":
+        state = PENDING[telegram_user_id]
+        try:
+            idx = int(text) - 1
+            acc = state["accounts"][idx]
+        except Exception:
+            await msg.reply_text("❌ Invalid selection", parse_mode="MarkdownV2")
+            return
+
+        state["stage"] = "add_project"
+        state["user_id"] = acc["user_id"]
+        state["projects"] = acc["projects"]
+
+        await reply_project_list(
+            msg,
+            f"Add *@{md_escape(state['ig'])}* to:",
+            acc["projects"],
+        )
+        return
+
+    # ==========================
+    # ADD FLOW — PROJECT PICK
+    # ==========================
+    if telegram_user_id in PENDING and PENDING[telegram_user_id]["stage"] == "add_project":
+        state = PENDING[telegram_user_id]
         try:
             idx = int(text) - 1
             project = state["projects"][idx]
         except Exception:
-            await msg.reply_text("❌ Invalid selection\\. Try again\\.", parse_mode="MarkdownV2")
+            await msg.reply_text("❌ Invalid selection", parse_mode="MarkdownV2")
             return
 
-        ig = state["ig_username"]
-        safe_ig = md_escape(ig)
-        safe_project = md_escape(project["name"])
+        ig = state["ig"]
 
         row = (
-            supabase
-            .table("monitored_accounts")
+            supabase.table("monitored_accounts")
             .select("id, ig_username")
             .eq("project_id", project["id"])
             .single()
@@ -137,48 +151,104 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "ig_username": ig,
                 "is_active": True,
             }).execute()
-
-            await msg.reply_text(
-                f"✅ *@{safe_ig}* added to *{safe_project}*",
-                parse_mode="MarkdownV2",
-            )
-
         else:
-            existing = [
-                u.strip()
-                for u in (row["ig_username"] or "").split(",")
-                if u.strip()
-            ]
-
-            if ig in existing:
-                await msg.reply_text(
-                    f"⚠️ *@{safe_ig}* already exists in *{safe_project}*",
-                    parse_mode="MarkdownV2",
-                )
-            else:
+            existing = [u.strip() for u in row["ig_username"].split(",")]
+            if ig not in existing:
                 existing.append(ig)
                 supabase.table("monitored_accounts").update({
                     "ig_username": ", ".join(existing)
                 }).eq("id", row["id"]).execute()
 
-                await msg.reply_text(
-                    f"✅ *@{safe_ig}* added to *{safe_project}*",
-                    parse_mode="MarkdownV2",
-                )
+        await msg.reply_text(
+            f"✅ *@{md_escape(ig)}* added to *{md_escape(project['name'])}*",
+            parse_mode="MarkdownV2",
+        )
 
         del PENDING[telegram_user_id]
         return
 
-    # ======================================================
-    # NEW MESSAGE → TRY IG USERNAME
-    # ======================================================
+    # ==========================
+    # REMOVE FLOW — PROJECT PICK
+    # ==========================
+    if telegram_user_id in PENDING and PENDING[telegram_user_id]["stage"] == "remove_project":
+        state = PENDING[telegram_user_id]
+        try:
+            idx = int(text) - 1
+            project = state["projects"][idx]
+        except Exception:
+            await msg.reply_text("❌ Invalid selection", parse_mode="MarkdownV2")
+            return
+
+        rows = (
+            supabase.table("monitored_accounts")
+            .select("id, ig_username")
+            .eq("project_id", project["id"])
+            .execute()
+            .data or []
+        )
+
+        usernames = []
+        for r in rows:
+            for u in r["ig_username"].split(","):
+                usernames.append(u.strip())
+
+        if not usernames:
+            await msg.reply_text("ℹ️ No monitored accounts", parse_mode="MarkdownV2")
+            del PENDING[telegram_user_id]
+            return
+
+        state["stage"] = "remove_user"
+        state["rows"] = rows
+        state["usernames"] = usernames
+
+        reply = "Choose username to remove:\n\n"
+        for i, u in enumerate(usernames, 1):
+            reply += f"{i}\\. @{md_escape(u)}\n"
+
+        await msg.reply_text(reply, parse_mode="MarkdownV2")
+        return
+
+    # ==========================
+    # REMOVE FLOW — USER PICK
+    # ==========================
+    if telegram_user_id in PENDING and PENDING[telegram_user_id]["stage"] == "remove_user":
+        state = PENDING[telegram_user_id]
+        try:
+            idx = int(text) - 1
+            username = state["usernames"][idx]
+        except Exception:
+            await msg.reply_text("❌ Invalid selection", parse_mode="MarkdownV2")
+            return
+
+        for r in state["rows"]:
+            existing = [u.strip() for u in r["ig_username"].split(",")]
+            if username in existing:
+                existing.remove(username)
+                if not existing:
+                    supabase.table("monitored_accounts").delete().eq("id", r["id"]).execute()
+                else:
+                    supabase.table("monitored_accounts").update({
+                        "ig_username": ", ".join(existing)
+                    }).eq("id", r["id"]).execute()
+                break
+
+        await msg.reply_text(
+            f"🗑️ *@{md_escape(username)}* removed",
+            parse_mode="MarkdownV2",
+        )
+
+        del PENDING[telegram_user_id]
+        return
+
+    # ==========================
+    # NEW MESSAGE → TRY ADD IG USERNAME
+    # ==========================
     ig_username = extract_ig_username(text)
     if not ig_username:
         return
 
     telegram_accounts = (
-        supabase
-        .table("telegram_accounts")
+        supabase.table("telegram_accounts")
         .select("user_id")
         .eq("chat_id", telegram_user_id)
         .execute()
@@ -186,27 +256,25 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if not telegram_accounts:
-        await msg.reply_text("❌ Please complete setup first\\.", parse_mode="MarkdownV2")
+        await msg.reply_text("❌ Please complete setup first", parse_mode="MarkdownV2")
         return
 
     accounts = []
-
     for row in telegram_accounts:
         projects = (
-            supabase
-            .table("projects")
+            supabase.table("projects")
             .select("id,name,destination_instagram")
             .eq("user_id", row["user_id"])
             .eq("active", True)
             .execute()
-            .data
+            .data or []
         )
 
         if not projects:
             continue
 
         dest = projects[0].get("destination_instagram") or "unknown"
-        label = f"@{md_escape(dest)} \\({len(projects)} project{'s' if len(projects) > 1 else ''}\\)"
+        label = f"@{dest} — {len(projects)} project{'s' if len(projects) != 1 else ''}"
 
         accounts.append({
             "user_id": row["user_id"],
@@ -215,44 +283,129 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
 
     if not accounts:
-        await msg.reply_text("❌ No active projects found\\.", parse_mode="MarkdownV2")
+        await msg.reply_text("❌ No active projects found", parse_mode="MarkdownV2")
         return
 
-    # ======================================================
     # MULTIPLE ACCOUNTS
-    # ======================================================
     if len(accounts) > 1:
         PENDING[telegram_user_id] = {
-            "ig_username": ig_username,
+            "stage": "add_user",
+            "ig": ig_username,
             "accounts": accounts,
-            "stage": "user",
         }
 
-        reply = "Multiple accounts found\\. Choose one:\n\n"
+        reply = "Choose account:\n\n"
         for i, acc in enumerate(accounts, 1):
-            reply += f"{i}\\. {acc['label']}\n"
+            reply += f"{i}\\. {md_escape(acc['label'])}\n"
 
         await msg.reply_text(reply, parse_mode="MarkdownV2")
         return
 
-    # ======================================================
-    # SINGLE ACCOUNT → PROJECT PICK
-    # ======================================================
+    # SINGLE ACCOUNT
     PENDING[telegram_user_id] = {
-        "ig_username": ig_username,
+        "stage": "add_project",
+        "ig": ig_username,
+        "user_id": accounts[0]["user_id"],
         "projects": accounts[0]["projects"],
-        "stage": "project",
     }
 
-    await reply_project_list(msg, ig_username, accounts[0]["projects"])
-
+    await reply_project_list(
+        msg,
+        f"Add *@{md_escape(ig_username)}* to:",
+        accounts[0]["projects"],
+    )
 
 # ==========================
-# ERROR HANDLER (IMPORTANT)
+# LIST HANDLER
+# ==========================
+async def handle_list(msg, telegram_user_id: str):
+    telegram_accounts = (
+        supabase.table("telegram_accounts")
+        .select("user_id")
+        .eq("chat_id", telegram_user_id)
+        .execute()
+        .data
+    )
+
+    if not telegram_accounts:
+        await msg.reply_text("❌ Setup required", parse_mode="MarkdownV2")
+        return
+
+    reply = "📋 *Monitored Accounts*\n\n"
+
+    for row in telegram_accounts:
+        projects = (
+            supabase.table("projects")
+            .select("id,name")
+            .eq("user_id", row["user_id"])
+            .execute()
+            .data or []
+        )
+
+        for p in projects:
+            rows = (
+                supabase.table("monitored_accounts")
+                .select("ig_username")
+                .eq("project_id", p["id"])
+                .execute()
+                .data or []
+            )
+
+            reply += f"*{md_escape(p['name'])}*\n"
+            if not rows:
+                reply += "_No accounts_\n\n"
+                continue
+
+            for r in rows:
+                for u in r["ig_username"].split(","):
+                    reply += f"• @{md_escape(u.strip())}\n"
+            reply += "\n"
+
+    await msg.reply_text(reply, parse_mode="MarkdownV2")
+
+# ==========================
+# REMOVE START
+# ==========================
+async def handle_remove_start(msg, telegram_user_id: str):
+    telegram_accounts = (
+        supabase.table("telegram_accounts")
+        .select("user_id")
+        .eq("chat_id", telegram_user_id)
+        .execute()
+        .data
+    )
+
+    if not telegram_accounts:
+        await msg.reply_text("❌ Setup required", parse_mode="MarkdownV2")
+        return
+
+    projects = []
+    for row in telegram_accounts:
+        rows = (
+            supabase.table("projects")
+            .select("id,name")
+            .eq("user_id", row["user_id"])
+            .execute()
+            .data or []
+        )
+        projects.extend(rows)
+
+    if not projects:
+        await msg.reply_text("❌ No projects found", parse_mode="MarkdownV2")
+        return
+
+    PENDING[telegram_user_id] = {
+        "stage": "remove_project",
+        "projects": projects,
+    }
+
+    await reply_project_list(msg, "Choose project to remove from:", projects)
+
+# ==========================
+# ERROR HANDLER
 # ==========================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled exception in bot", exc_info=context.error)
-
+    log.exception("Unhandled exception", exc_info=context.error)
 
 # ==========================
 # START BOT
@@ -264,7 +417,6 @@ def main():
 
     log.info("🤖 Telegram bot started")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()

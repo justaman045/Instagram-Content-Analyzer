@@ -96,7 +96,7 @@ def run_analyze(
             reels = (
                 supabase
                 .table("reels")
-                .select("reel_url")
+                .select("reel_url, created_at")
                 .eq("project_id", pid)
                 .execute()
                 .data or []
@@ -106,6 +106,7 @@ def run_analyze(
 
             for r in reels:
                 url = r["reel_url"]
+                age = hours_between(r["created_at"], datetime.now(timezone.utc).isoformat())
 
                 snaps = (
                     supabase
@@ -123,6 +124,7 @@ def run_analyze(
                     continue
 
                 cur, prev = snaps
+                # print(prev, cur)
                 hrs = hours_between(
                     prev["captured_at"],
                     cur["captured_at"],
@@ -140,7 +142,7 @@ def run_analyze(
                 ranked.append(
                     {
                         "url": url,
-                        "age": f"{int(hrs * 60)} min",
+                        "age": f"{int(age) * 60}",
                         "dv": dv,
                         "dl": dl,
                         "dc": dc,
@@ -156,7 +158,9 @@ def run_analyze(
                 log.info("[dim]No analyzable reels[/dim]")
                 continue
 
-            ranked.sort(key=lambda x: x["score"], reverse=True)
+            print(ranked[0]["age"])
+
+            ranked.sort(key=lambda x: (x["score"], -int(x["age"])), reverse=True)
 
             # =========================
             # PREVIEW MODE
@@ -186,7 +190,7 @@ def run_analyze(
                         r["trend"],
                     )
 
-                log.info(table)
+                print(table)
                 continue
 
             # =========================

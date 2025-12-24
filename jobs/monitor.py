@@ -1,11 +1,11 @@
 # jobs/monitor.py
 
-import os
 import time
 import random
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
+
 from dateutil.parser import isoparse
 
 from instagram.fetch import fetch_reels
@@ -26,24 +26,28 @@ for lib in ("httpx", "httpcore", "postgrest", "supabase", "urllib3"):
     logging.getLogger(lib).setLevel(logging.WARNING)
 
 # ======================================================
-# GLOBAL SAFETY LIMITS (CRITICAL)
+# SAFETY LIMITS
 # ======================================================
-MAX_REQUESTS_PER_HOUR = 120          # HARD CAP
-BATCH_SIZE = 5                      # accounts per mini-session
-BATCH_COOLDOWN_RANGE = (900, 1800)   # 15–30 min
-SESSION_COOLDOWN_RANGE = (3600, 7200)  # 1–2 hours
-MAX_PROJECT_RUNTIME_MIN = 45         # stop even if work remains
+MAX_REQUESTS_PER_HOUR = 120
+BATCH_SIZE = 5
+BATCH_COOLDOWN_RANGE = (900, 1800)       # 15–30 min
+SESSION_COOLDOWN_RANGE = (3600, 7200)    # 1–2 hours
+MAX_PROJECT_RUNTIME_MIN = 45
 
 # ======================================================
-# SNAPSHOT / PRUNING CONFIG
+# SNAPSHOT / PRUNE CONFIG
 # ======================================================
 SNAPSHOT_RETENTION = 6
+
 MIN_VIEW_DELTA = 20
 MIN_VIEWS_PER_HOUR = 5
 
 MAX_INACTIVE_DAYS = 2
 MAX_REEL_AGE_DAYS = 5
 MIN_TOTAL_VIEWS = 100
+
+MAX_MISSING_RUNS = 3        # 🚨 deletion confirmation
+HARD_STALE_DAYS = 3         # 🚨 hard kill even if exists
 
 # ======================================================
 # TIME HELPERS
@@ -99,7 +103,7 @@ def should_insert_snapshot(project_id: str, reel_url: str, reel: Dict) -> bool:
     if dv >= MIN_VIEW_DELTA or dl > 0 or dc > 0:
         return True
 
-    if mins_since >= 360:  # 6 hours
+    if mins_since >= 360:
         return True
 
     return False
@@ -120,20 +124,26 @@ def trim_snapshots(project_id: str, reel_url: str):
         supabase.table("reel_snapshots").delete().in_("id", ids).execute()
 
 # ======================================================
-# PRUNING LOGIC
+# PRUNE LOGIC
 # ======================================================
 def should_prune_reel(project_id: str, reel: dict) -> bool:
     reel_url = reel["reel_url"]
     snaps = get_snapshots(project_id, reel_url, limit=2)
 
-    # A — inactive too long
-    last_seen = parse_ts(reel["last_seen_at"])
-    if now_utc() - last_seen > timedelta(days=MAX_INACTIVE_DAYS):
+    # 🚨 Hard stale kill
+    if now_utc() - parse_ts(reel["last_seen_at"]) > timedelta(days=HARD_STALE_DAYS):
         return True
 
-    # B — low growth rate
+    # A — inactive
+    if now_utc() - parse_ts(reel["last_seen_at"]) > timedelta(days=MAX_INACTIVE_DAYS):
+        return True
+
+    # B — flat or weak growth
     if len(snaps) >= 2:
         cur, prev = snaps
+        if cur["views"] <= prev["views"]:
+            return True
+
         hours = max(
             (parse_ts(cur["captured_at"]) - parse_ts(prev["captured_at"]))
             .total_seconds() / 3600,
@@ -151,7 +161,42 @@ def should_prune_reel(project_id: str, reel: dict) -> bool:
     return False
 
 # ======================================================
-# MAIN MONITOR JOB (SAFE)
+# DELETED REEL RECONCILIATION
+# ======================================================
+def reconcile_missing_reels(project_id: str, seen_reels: Set[str]):
+    rows = (
+        supabase.table("reels")
+        .select("reel_url, missing_count")
+        .eq("project_id", project_id)
+        .execute()
+        .data or []
+    )
+
+    for r in rows:
+        if r["reel_url"] not in seen_reels:
+            misses = (r.get("missing_count") or 0) + 1
+
+            if misses >= MAX_MISSING_RUNS:
+                log.warning(f"🗑️ Deleting missing reel {r['reel_url']}")
+
+                supabase.table("reel_snapshots").delete() \
+                    .eq("project_id", project_id) \
+                    .eq("reel_url", r["reel_url"]).execute()
+
+                supabase.table("reels").delete() \
+                    .eq("project_id", project_id) \
+                    .eq("reel_url", r["reel_url"]).execute()
+            else:
+                supabase.table("reels").update(
+                    {"missing_count": misses}
+                ).eq(
+                    "project_id", project_id
+                ).eq(
+                    "reel_url", r["reel_url"]
+                ).execute()
+
+# ======================================================
+# MAIN MONITOR
 # ======================================================
 def run_monitor(project_id: Optional[str] = None):
     start_time = time.time()
@@ -168,7 +213,7 @@ def run_monitor(project_id: Optional[str] = None):
 
     for project in projects:
         if (time.time() - start_time) / 60 > MAX_PROJECT_RUNTIME_MIN:
-            log.warning("⏹️ Max runtime reached — stopping safely")
+            log.warning("⏹️ Max runtime reached — stopping")
             break
 
         pid = project["id"]
@@ -185,33 +230,30 @@ def run_monitor(project_id: Optional[str] = None):
         usernames = normalize_usernames(rows)
         random.shuffle(usernames)
 
+        seen_reels_this_run: Set[str] = set()
         batch_count = 0
 
         for username in usernames:
             if requests_this_run >= MAX_REQUESTS_PER_HOUR:
                 cooldown = random.uniform(*SESSION_COOLDOWN_RANGE)
-                log.warning(f"🛑 Hourly cap hit — cooling {cooldown:.0f}s")
+                log.warning(f"🛑 Hour cap hit — sleeping {cooldown:.0f}s")
                 time.sleep(cooldown)
                 blocked = True
                 break
 
-
             try:
-                log.info(f"🔍 Fetching {username}")
+                log.info(f"🔍 Fetching @{username}")
                 reels = fetch_reels(username)
 
-                # 🚫 Skipped due to Instagram block
                 if reels is None:
-                    log.warning(
-                        f"⏭️ skipped @{username} due to response being blocked by Instagram"
-                    )
+                    log.warning(f"⏭️ skipped @{username} (blocked by IG)")
                     blocked = True
                     break
-                elif reels == []:
-                    log.info(f"ℹ️ No reels found @{username}")
+
+                if reels == []:
+                    log.info(f"ℹ️ No reels @{username}")
                 else:
-                    if not blocked:
-                        time.sleep(60)
+                    time.sleep(60)
 
                 requests_this_run += 1
                 batch_count += 1
@@ -223,6 +265,7 @@ def run_monitor(project_id: Optional[str] = None):
             for reel in reels:
                 now = now_utc().isoformat()
                 reel_url = reel["url"]
+                seen_reels_this_run.add(reel_url)
 
                 supabase.table("reels").upsert(
                     {
@@ -232,6 +275,7 @@ def run_monitor(project_id: Optional[str] = None):
                         "likes": reel["likes"],
                         "comments": reel["comments"],
                         "last_seen_at": now,
+                        "missing_count": 0,
                     },
                     on_conflict="project_id,reel_url",
                 ).execute()
@@ -254,18 +298,20 @@ def run_monitor(project_id: Optional[str] = None):
 
                 trim_snapshots(pid, reel_url)
 
-            # 🔁 BATCH COOLDOWN
             if batch_count >= BATCH_SIZE:
                 cooldown = random.uniform(*BATCH_COOLDOWN_RANGE)
                 log.info(f"😴 Batch cooldown {cooldown:.0f}s")
                 time.sleep(cooldown)
                 batch_count = 0
-        
+
         if blocked:
-            log.error("🚫 Instagram blocked Partially Completed — stopping monitor run safely")
+            log.error("🚫 Instagram blocked — stopping safely")
             break
 
-        # 🔥 FINAL PRUNE PASS
+        # 🔥 Deleted reel cleanup
+        reconcile_missing_reels(pid, seen_reels_this_run)
+
+        # 🔥 Final prune
         all_reels = (
             supabase.table("reels")
             .select("*")
