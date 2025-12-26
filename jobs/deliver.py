@@ -37,27 +37,55 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def is_delivery_due(settings: dict) -> bool:
+def get_last_delivery_attempt(project_id: str) -> Optional[datetime]:
     """
-    Delivery is allowed if current local time is AFTER send_hour.
-    Safe even if scheduler runs late.
+    Returns the last time the delivery job successfully ran for this project.
+    """
+    row = (
+        supabase
+        .table("sent_reels")
+        .select("sent_at")
+        .eq("project_id", project_id)
+        .order("sent_at", desc=True)
+        .limit(1)
+        .execute()
+        .data
+    )
+
+    if not row:
+        return None
+
+    return datetime.fromisoformat(row[0]["sent_at"])
+
+
+def is_batch_responsible(settings: dict, last_run: Optional[datetime]) -> bool:
+    """
+    Send ONLY if this batch is the FIRST batch AFTER scheduled time.
+
+    Rule:
+        last_run < scheduled_time <= now
     """
     tz = pytz.timezone(settings["timezone"])
     now_local = utc_now().astimezone(tz)
 
-
-    delivery_time = now_local.replace(
+    scheduled_time = now_local.replace(
         hour=settings["send_hour"],
-        minute=0,
+        minute=settings.get("send_minute", 0),
         second=0,
         microsecond=0,
     )
 
-    log.info(now_local)
-    log.info(delivery_time)
-    log.info(now_local >= delivery_time)
+    if last_run:
+        last_run = last_run.astimezone(tz)
+    else:
+        # First ever run → allow if already past scheduled time
+        return now_local >= scheduled_time
 
-    return now_local >= delivery_time
+    log.info(f"Last run       : {last_run}")
+    log.info(f"Scheduled time : {scheduled_time}")
+    log.info(f"Now            : {now_local}")
+
+    return last_run < scheduled_time <= now_local
 
 
 def already_sent_today(project_id: str) -> bool:
@@ -83,9 +111,6 @@ def already_sent_today(project_id: str) -> bool:
 
 
 def fetch_latest_caption(project_id: str, reel_url: str) -> str:
-    """
-    Fetch caption from latest reel snapshot.
-    """
     snap = (
         supabase
         .table("reel_snapshots")
@@ -108,40 +133,22 @@ def fetch_latest_caption(project_id: str, reel_url: str) -> str:
 # MAIN JOB
 # ==========================
 def run_deliver(project_id: Optional[str] = None) -> int:
-    """
-    Delivers ONE recommended reel per project per day.
-    Returns number of reels delivered.
-    """
     delivered_count = 0
 
-    # -------------------------
-    # Resolve projects
-    # -------------------------
     query = supabase.table("projects").select("*")
-
-    if project_id:
-        query = query.eq("id", project_id)
-    else:
-        query = query.eq("active", True)
+    query = query.eq("id", project_id) if project_id else query.eq("active", True)
 
     projects = query.execute().data or []
-
     if not projects:
-        log.warning("No projects found for delivery")
+        log.warning("No projects found")
         return 0
 
-    # -------------------------
-    # Process projects
-    # -------------------------
     for project in projects:
         pid = project["id"]
         uid = project["user_id"]
 
         log.info(f"📦 Delivery check → {project['name']}")
 
-        # -------------------------
-        # Delivery settings
-        # -------------------------
         settings = (
             supabase
             .table("delivery_settings")
@@ -153,12 +160,8 @@ def run_deliver(project_id: Optional[str] = None) -> int:
         )
 
         if not settings:
-            log.warning("No delivery settings")
             continue
 
-        # -------------------------
-        # Telegram config
-        # -------------------------
         telegram = (
             supabase
             .table("telegram_accounts")
@@ -170,26 +173,19 @@ def run_deliver(project_id: Optional[str] = None) -> int:
         )
 
         if not telegram:
-            log.warning("Telegram not configured")
             continue
 
-        # -------------------------
-        # Time gate
-        # -------------------------
         if not DEV_MODE:
-            if not is_delivery_due(settings):
-                log.info("⏳ Delivery time not reached")
+            last_run = get_last_delivery_attempt(pid)
+
+            if not is_batch_responsible(settings, last_run):
+                log.info("⏭ Batch not responsible for this delivery")
                 continue
 
             if already_sent_today(pid):
-                log.info("📭 Already delivered today")
+                log.info("📭 Already sent today")
                 continue
-        else:
-            log.warning("⚠ DEV MODE: bypassing time checks")
 
-        # -------------------------
-        # Recommended reel
-        # -------------------------
         reel = (
             supabase
             .table("reels")
@@ -202,21 +198,12 @@ def run_deliver(project_id: Optional[str] = None) -> int:
         )
 
         if not reel:
-            log.info("No recommended reel")
             continue
 
         reel = reel[0]
-
-        # -------------------------
-        # Fetch caption from snapshot
-        # -------------------------
         caption = fetch_latest_caption(pid, reel["reel_url"])
-
         caption_block = f"\n\n📝 <b>Caption</b>\n{caption}" if caption else ""
 
-        # -------------------------
-        # Send message
-        # -------------------------
         message = (
             "<b>🔥 Trending Reel</b>\n\n"
             f"{reel['reel_url']}\n"
@@ -231,9 +218,6 @@ def run_deliver(project_id: Optional[str] = None) -> int:
             message,
         )
 
-        # -------------------------
-        # Record delivery
-        # -------------------------
         supabase.table("sent_reels").insert(
             {
                 "project_id": pid,
@@ -243,6 +227,6 @@ def run_deliver(project_id: Optional[str] = None) -> int:
         ).execute()
 
         delivered_count += 1
-        log.info(f"[green]✅ Delivered[/green] {reel['reel_url']}")
+        log.info(f"✅ Delivered {reel['reel_url']}")
 
     return delivered_count

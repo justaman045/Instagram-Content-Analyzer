@@ -20,6 +20,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("analyze")
+
 # ==========================
 # SILENCE NOISY LIBRARIES
 # ==========================
@@ -28,7 +29,6 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("postgrest").setLevel(logging.WARNING)
 logging.getLogger("supabase").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
-
 
 console = Console()
 
@@ -88,11 +88,29 @@ def run_analyze(
         pid = project["id"]
         pname = project["name"]
 
-        log.info(
-            f"\n[bold underline]📁 Project: {pname}[/bold underline]"
-        )
+        log.info(f"\n[bold underline]📁 Project: {pname}[/bold underline]")
 
         try:
+            # -------------------------
+            # Fetch already sent reels
+            # -------------------------
+            sent_rows = (
+                supabase
+                .table("sent_reels")
+                .select("reel_url")
+                .eq("project_id", pid)
+                .execute()
+                .data or []
+            )
+
+            sent_urls = {r["reel_url"] for r in sent_rows}
+
+            if sent_urls:
+                log.info(f"🚫 Skipping {len(sent_urls)} already delivered reels")
+
+            # -------------------------
+            # Fetch all reels
+            # -------------------------
             reels = (
                 supabase
                 .table("reels")
@@ -106,7 +124,15 @@ def run_analyze(
 
             for r in reels:
                 url = r["reel_url"]
-                age = hours_between(r["created_at"], datetime.now(timezone.utc).isoformat())
+
+                # ⛔ Skip reels already sent
+                if url in sent_urls:
+                    continue
+
+                age = hours_between(
+                    r["created_at"],
+                    datetime.now(timezone.utc).isoformat(),
+                )
 
                 snaps = (
                     supabase
@@ -124,7 +150,7 @@ def run_analyze(
                     continue
 
                 cur, prev = snaps
-                # print(prev, cur)
+
                 hrs = hours_between(
                     prev["captured_at"],
                     cur["captured_at"],
@@ -142,7 +168,7 @@ def run_analyze(
                 ranked.append(
                     {
                         "url": url,
-                        "age": f"{int(age) * 60}",
+                        "age": f"{int(age * 60)}",
                         "dv": dv,
                         "dl": dl,
                         "dc": dc,
@@ -155,12 +181,13 @@ def run_analyze(
                 )
 
             if not ranked:
-                log.info("[dim]No analyzable reels[/dim]")
+                log.info("[dim]No new reels available to recommend[/dim]")
                 continue
 
-            print(ranked[0]["age"])
-
-            ranked.sort(key=lambda x: (x["score"], -int(x["age"])), reverse=True)
+            ranked.sort(
+                key=lambda x: (x["score"], -int(x["age"])),
+                reverse=True,
+            )
 
             # =========================
             # PREVIEW MODE
@@ -207,9 +234,7 @@ def run_analyze(
                     "score": best["score"],
                     "trend": best["trend"],
                     "is_recommended": True,
-                    "analyzed_at": datetime.now(
-                        timezone.utc
-                    ).isoformat(),
+                    "analyzed_at": datetime.now(timezone.utc).isoformat(),
                 }
             ).eq("project_id", pid).eq(
                 "reel_url", best["url"]
