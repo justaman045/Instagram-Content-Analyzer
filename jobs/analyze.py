@@ -48,15 +48,27 @@ def hours_between(t1: str, t2: str) -> float:
 
 
 # =========================================================
-# Trend detection (UNCHANGED)
+# Trend detection
 # =========================================================
-def detect_trend(rate_vph, score, prev_score):
-    if rate_vph >= 300 and score >= prev_score * 0.9:
-        return "PEAK 🔥"
-    if rate_vph >= 80 and score > prev_score:
-        return "RISING 🚀"
-    if rate_vph <= 20 and score < prev_score:
-        return "DYING 💤"
+def detect_trend(velocity, acceleration, score):
+    """
+    Classifies the growth trajectory based on velocity (VPH) and acceleration (ΔVPH/hr).
+    """
+    if velocity > 250 and acceleration > 50:
+        return "VIRAL 🦄"
+    
+    if acceleration > 20:
+        return "EXPLODING 🧨"
+    
+    if acceleration > 5:
+        return "HEATING UP 🔥"
+    
+    if -5 <= acceleration <= 5:
+        return "STEADY 📈"
+    
+    if acceleration < -5:
+        return "COOLING ❄️"
+        
     return "STABLE ⚖️"
 
 
@@ -68,7 +80,7 @@ def run_analyze(
     project_id: Optional[str] = None,
 ):
     log.info("📊 Analyze job started")
-    log.info("[bold cyan]📊 Analyze Job – Momentum Engine[/bold cyan]\n")
+    log.info("[bold cyan]📊 Analyze Job – Momentum Engine (v2)[/bold cyan]\n")
 
     # -------------------------
     # Fetch projects
@@ -105,16 +117,13 @@ def run_analyze(
 
             sent_urls = {r["reel_url"] for r in sent_rows}
 
-            if sent_urls:
-                log.info(f"🚫 Skipping {len(sent_urls)} already delivered reels")
-
             # -------------------------
             # Fetch all reels
             # -------------------------
             reels = (
                 supabase
                 .table("reels")
-                .select("reel_url, created_at")
+                .select("reel_url, owner_handle, created_at, views, likes, comments")
                 .eq("project_id", pid)
                 .execute()
                 .data or []
@@ -134,6 +143,7 @@ def run_analyze(
                     datetime.now(timezone.utc).isoformat(),
                 )
 
+                # Fetch MORE snapshots to calculate acceleration
                 snaps = (
                     supabase
                     .table("reel_snapshots")
@@ -141,7 +151,7 @@ def run_analyze(
                     .eq("project_id", pid)
                     .eq("reel_url", url)
                     .order("captured_at", desc=True)
-                    .limit(2)
+                    .limit(3)  # Need 3 points for acceleration (current, prev, prev_prev)
                     .execute()
                     .data or []
                 )
@@ -149,34 +159,58 @@ def run_analyze(
                 if len(snaps) < 2:
                     continue
 
-                cur, prev = snaps
+                # -------------------------
+                # METRICS CALCULATION
+                # -------------------------
+                cur = snaps[0]
+                prev = snaps[1]
+                
+                # Interval 1 (Most Recent)
+                h1 = hours_between(prev["captured_at"], cur["captured_at"])
+                d_views_1 = cur["views"] - prev["views"]
+                velocity_1 = d_views_1 / h1  # Current Velocity
 
-                hrs = hours_between(
-                    prev["captured_at"],
-                    cur["captured_at"],
-                )
+                # Interval 2 (Previous) - Optional (if 3rd snap exists)
+                velocity_2 = 0
+                acceleration = 0
 
-                dv = cur["views"] - prev["views"]
-                dl = cur["likes"] - prev["likes"]
-                dc = cur["comments"] - prev["comments"]
+                if len(snaps) >= 3:
+                    prev_2 = snaps[2]
+                    h2 = hours_between(prev_2["captured_at"], prev["captured_at"])
+                    d_views_2 = prev["views"] - prev_2["views"]
+                    velocity_2 = d_views_2 / h2
+                    
+                    # Acceleration: Change in velocity per hour
+                    # (v_current - v_old) / time_between_midpoints roughly
+                    # Simplified: just delta velocity
+                    acceleration = (velocity_1 - velocity_2)
 
-                rate_vph = dv / hrs
-                engagement = (dl / hrs) * 1.5 + (dc / hrs) * 2.0
-                score = (rate_vph * 1.2) + engagement
-                prev_score = max(prev["views"] / hrs, 1)
+                # Engagement Quality (safe division)
+                # Likes/Views ratio + Comments/Views ratio
+                # We use current total stats for this quality check
+                safe_views = max(r["views"], 1)
+                eng_quality = ((r["likes"] / safe_views) * 100) + ((r["comments"] / safe_views) * 200)
+
+                # -------------------------
+                # SCORING FORMULA
+                # -------------------------
+                # Score = (Velocity * 1.0) + (Acceleration * 2.0) + (EngagementQuality * 5.0)
+                # Acceleration is heavily weighted to catch "Exploding" trends early
+                score = (velocity_1 * 1.0) + (acceleration * 2.0) + (eng_quality * 5.0)
+
+                trend_label = detect_trend(velocity_1, acceleration, score)
 
                 ranked.append(
                     {
                         "url": url,
-                        "age": f"{int(age * 60)}",
-                        "dv": dv,
-                        "dl": dl,
-                        "dc": dc,
-                        "rate": round(rate_vph, 2),
-                        "score": round(score, 2),
-                        "trend": detect_trend(
-                            rate_vph, score, prev_score
-                        ),
+                        "owner_handle": r.get("owner_handle"), # Pass handle for feedback loop
+                        "age": f"{int(age * 60)}m",
+                        "velocity": round(velocity_1, 1),
+                        "accel": round(acceleration, 1),
+                        "eng_q": round(eng_quality, 1),
+                        "score": round(score, 1),
+                        "trend": trend_label,
+                        "d_views": d_views_1,
                     }
                 )
 
@@ -184,10 +218,8 @@ def run_analyze(
                 log.info("[dim]No new reels available to recommend[/dim]")
                 continue
 
-            ranked.sort(
-                key=lambda x: (x["score"], -int(x["age"])),
-                reverse=True,
-            )
+            # Sort by Score DESC
+            ranked.sort(key=lambda x: x["score"], reverse=True)
 
             # =========================
             # PREVIEW MODE
@@ -197,22 +229,22 @@ def run_analyze(
                 table.add_column("Rank")
                 table.add_column("Reel")
                 table.add_column("Age")
-                table.add_column("ΔV")
-                table.add_column("ΔL")
-                table.add_column("ΔC")
-                table.add_column("V/hr")
+                table.add_column("ΔV (curr)")
+                table.add_column("Vel (v/h)")
+                table.add_column("Accel")
+                table.add_column("Eng%")
                 table.add_column("Score")
-                table.add_column("Trend")
+                table.add_column("Trend", style="bold")
 
                 for i, r in enumerate(ranked, 1):
                     table.add_row(
                         str(i),
                         r["url"],
                         r["age"],
-                        str(r["dv"]),
-                        str(r["dl"]),
-                        str(r["dc"]),
-                        str(r["rate"]),
+                        str(r["d_views"]),
+                        str(r["velocity"]),
+                        f"[green]{r['accel']}[/green]" if r['accel'] > 0 else f"[red]{r['accel']}[/red]",
+                        str(r["eng_q"]),
                         str(r["score"]),
                         r["trend"],
                     )
@@ -225,10 +257,12 @@ def run_analyze(
             # =========================
             best = ranked[0]
 
+            # Reset previous recommendations
             supabase.table("reels").update(
                 {"is_recommended": False}
             ).eq("project_id", pid).execute()
 
+            # Set new recommendation
             supabase.table("reels").update(
                 {
                     "score": best["score"],
@@ -241,8 +275,61 @@ def run_analyze(
             ).execute()
 
             log.info(
-                f"[green]⭐ Recommended[/green] {best['url']} ({best['trend']})"
+                f"[green]⭐ Recommended[/green] {best['url']} "
+                f"(Score: {best['score']} | {best['trend']})"
             )
+            
+            # =========================
+            # FEEDBACK LOOP (ADAPTIVE-V3)
+            # =========================
+            # 1. Aggregate Max Score per User
+            user_max_scores = {}
+            for r in ranked:
+                u = r.get("owner_handle")
+                if not u:
+                    continue
+                
+                # Keep the highest score seen for this user
+                if u not in user_max_scores or r["score"] > user_max_scores[u]:
+                    user_max_scores[u] = r["score"]
+
+            # 2. Update Monitored Accounts
+            updates_count = 0
+            for handle, max_score in user_max_scores.items():
+                # Logic: Map Score -> Priority/Freq
+                # Score > 2.0 (Viral) -> 1h, Prio 3.0
+                # Score > 1.0 (Heating) -> 2h, Prio 1.5
+                # Score < 0 (Cooling) -> 12h, Prio 0.5
+                
+                new_freq = 6  # Default
+                new_prio = 1.0
+                
+                if max_score >= 2.0:
+                    new_freq = 1
+                    new_prio = 3.0
+                elif max_score >= 1.0:
+                    new_freq = 2
+                    new_prio = 1.5
+                elif max_score < 0:
+                    new_freq = 12
+                    new_prio = 0.5
+                else: 
+                    # 0.0 - 0.9 (Steady)
+                    new_freq = 6
+                    new_prio = 1.0
+
+                try:
+                    # Update DB
+                    supabase.table("monitored_accounts").update({
+                        "check_frequency": new_freq,
+                        "priority_score": new_prio
+                    }).eq("project_id", pid).eq("ig_username", handle).execute()
+                    updates_count += 1
+                except Exception:
+                    log.warning(f"Failed to update priority for @{handle}")
+
+            log.info(f"🔄 Adaptive Feedback: Updated {updates_count} accounts")
+ 
 
         except Exception:
             log.exception(f"Analyze failed for project: {pname}")

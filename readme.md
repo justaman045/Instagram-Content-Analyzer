@@ -215,6 +215,51 @@ Contributions are welcome. Suggested workflow:
 Please avoid committing secrets or private keys.
 
 
+## Deployment
+
+## Deployment
+
+## Deployment: Dual Mode Strategy
+
+To keep the system robust and decoupled, this repository separates **Core Logic** from **User Interaction**.
+
+### 1. The Engine (Runs Automatically)
+-   **Script**: `core_runner.py`
+-   **Schedule**: Runs every 6 hours on GitHub Actions.
+-   **Job**: Monitor -> Analyze -> Deliver.
+-   **Behavior**: It processes all active projects in a batch and then exits. It does **not** listen for Telegram commands.
+
+### 2. The Interface (Runs On-Demand)
+-   **Script**: `bot.py` (Manager Bot)
+-   **Trigger**:
+    -   **Doorbell**: When you message the bot, Google Apps Script triggers GHA.
+    -   **Manual**: Trigger "Run workflow" -> select Mode: `bot`.
+-   **Behavior**: It wakes up for 5-15 minutes to let you **add/remove accounts**. It does **not** process reels.
+
+### Setup "Wake on Message" (Doorbell)
+Since GHA is passive, we use a free Google Apps Script bridge.
+
+1.  **Get a GitHub Token**: [Generate Classic Token](https://github.com/settings/tokens) (`repo` scope).
+2.  **Create Script**: [script.google.com](https://script.google.com) -> Paste `resources/telegram_bridge.js`.
+3.  **Configure**: Fill in `GITHUB_TOKEN`, `Repo Name`, and `Bot Token`.
+4.  **Deploy**: Publish as Web App -> Access: "Anyone".
+5.  **Connect**: `https://api.telegram.org/bot<TOKEN>/setWebhook?url=<WEB_APP_URL>`
+
+**Result**:
+-   **Schedule**: Analysis happens silently in the background.
+-   **Message**: The bot wakes up instantly to manage your accounts.
+
+### VPS / Server (True 24/7)
+For true continuous uptime (instant replies), deploy to a VPS:
+
+1. Clone repo & install deps.
+2. Run with a process manager like `pm2`:
+   ```bash
+   # Set runtime to 0 or remove the env var to run forever
+   pm2 start bot.py --name instagram-bot --interpreter python3
+   ```
+
+
 ## Security & Responsible Use
 
 - Automating actions on Instagram may violate Instagram’s Terms of Service. This project is provided for educational purposes. The author is not responsible for any account bans or legal issues.

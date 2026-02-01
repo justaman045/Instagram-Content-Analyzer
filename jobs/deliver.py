@@ -189,7 +189,7 @@ def run_deliver(project_id: Optional[str] = None) -> int:
         reel = (
             supabase
             .table("reels")
-            .select("*")
+            .select("reel_url, owner_handle, views, likes, comments, trend, score")
             .eq("project_id", pid)
             .eq("is_recommended", True)
             .limit(1)
@@ -201,15 +201,48 @@ def run_deliver(project_id: Optional[str] = None) -> int:
             continue
 
         reel = reel[0]
+        # Fetch latest snapshot for caption
         caption = fetch_latest_caption(pid, reel["reel_url"])
-        caption_block = f"\n\n📝 <b>Caption</b>\n{caption}" if caption else ""
+        
+        # -------------------------
+        # FETCH MONITORING CONTEXT
+        # -------------------------
+        # We want to tell the user: "We are now checking this account every X hours"
+        monitor_info = ""
+        if reel.get("owner_handle"):
+            acc = (
+                supabase.table("monitored_accounts")
+                .select("check_frequency, priority_score")
+                .eq("project_id", pid)
+                .eq("ig_username", reel["owner_handle"])
+                .execute()
+                .data
+            )
+            if acc:
+                freq = acc[0]["check_frequency"]
+                prio = acc[0]["priority_score"]
+                monitor_info = f"\n\n⚙️ <i>Monitoring set to every <b>{freq}h</b> (Priority {prio})</i>"
 
+        # -------------------------
+        # FORMAT MESSAGE
+        # -------------------------
+        # Trend icons are already in 'trend' column (e.g. VIRAL 🦄)
+        
+        caption_block = f"\n\n📝 <b>Caption</b>\n{caption[:200]}..." if caption else ""
+        
+        # Safe defaults if columns missing (though migration v2/v3 ensures they exist)
+        score = reel.get("score", 0)
+        
         message = (
-            "<b>🔥 Trending Reel</b>\n\n"
-            f"{reel['reel_url']}\n"
-            f"👁 {reel['views']} | ❤️ {reel['likes']} | 💬 {reel['comments']}\n"
-            f"📈 {reel['trend']}"
+            f"🚨 <b>{reel['trend']} ALERT</b>\n\n"
+            f"🔗 <a href='{reel['reel_url']}'><b>View Reel</b></a>\n\n"
+            f"� <b>Stats</b>\n"
+            f"• Score: <b>{score}</b>\n"
+            f"• Views: {reel['views']:,}\n"
+            f"• Likes: {reel['likes']:,}\n"
+            f"• Comments: {reel['comments']:,}\n"
             f"{caption_block}"
+            f"{monitor_info}"
         )
 
         send_message(

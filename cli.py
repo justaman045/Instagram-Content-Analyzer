@@ -1,14 +1,17 @@
 import argparse
 import logging
-import os
 import sys
+import asyncio
 from typing import List, Dict
 
 from db.supabase_client import supabase
 from jobs.monitor import run_monitor
 from jobs.analyze import run_analyze
 from jobs.deliver import run_deliver
-from setup.setup import run_setup   # 👈 ADD THIS
+from setup.setup import run_setup
+from jobs.batch import run_batch
+from configure_workflows import main as run_configure
+from tgram.runner import run_bot
 
 
 # ==========================
@@ -35,6 +38,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("postgrest").setLevel(logging.WARNING)
 logging.getLogger("supabase").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 
 # ==========================
@@ -76,7 +80,7 @@ def prompt_project_selection(projects: List[Dict]) -> str:
         except ValueError:
             pass
 
-        print("❌ Invalid selection, try again.")
+    print("❌ Invalid selection, try again.")
 
 
 # ==========================
@@ -95,8 +99,26 @@ def main() -> int:
         help="Run interactive project setup wizard"
     )
 
+    # ---- configure ----
+    sub.add_parser(
+        "configure",
+        help="Configure GitHub Actions workflows"
+    )
+
+    # ---- bot ----
+    sub.add_parser(
+        "bot",
+        help="Run Telegram Manager Bot (Interactive)"
+    )
+
+    # ---- runner_batch ----
+    sub.add_parser(
+        "runner",
+        help="Run Full Batch Pipeline (Monitor -> Analyze -> Deliver)"
+    )
+
     # ---- monitor ----
-    monitor = sub.add_parser("monitor", help="Run monitor job")
+    monitor = sub.add_parser("monitor", help="Run monitor job (Single Component)")
     monitor.add_argument(
         "--project",
         type=int,
@@ -104,7 +126,7 @@ def main() -> int:
     )
 
     # ---- analyze ----
-    analyze = sub.add_parser("analyze", help="Run analyze job")
+    analyze = sub.add_parser("analyze", help="Run analyze job (Single Component)")
     analyze.add_argument(
         "--inspect",
         action="store_true",
@@ -117,7 +139,7 @@ def main() -> int:
     )
 
     # ---- deliver ----
-    deliver = sub.add_parser("deliver", help="Run delivery job")
+    deliver = sub.add_parser("deliver", help="Run delivery job (Single Component)")
     deliver.add_argument(
         "--project",
         type=int,
@@ -129,6 +151,12 @@ def main() -> int:
     try:
         if args.command == "setup":
             run_setup()
+        elif args.command == "configure":
+            run_configure()
+        elif args.command == "bot":
+            asyncio.run(run_bot())
+        elif args.command == "runner":
+            run_batch()
         elif args.command == "monitor":
             projects = list_projects()
 

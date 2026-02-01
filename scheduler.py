@@ -135,17 +135,11 @@ def shutdown(signum, frame):
     stop_event.set()
 
 
-signal.signal(signal.SIGINT, shutdown)
-signal.signal(signal.SIGTERM, shutdown)
-
 # ==========================
-# MAIN
+# FACTORY
 # ==========================
-if __name__ == "__main__":
-    log.info("🚀 Scheduler starting")
-
-    project_id = resolve_project_id()
-    log.info(f"✅ Running for project: {project_id}")
+def start_scheduler_threads(project_id: str):
+    log.info(f"🚀 Starting scheduler threads for project: {project_id}")
 
     monitor_thread = threading.Thread(
         target=monitor_loop,
@@ -162,11 +156,5 @@ if __name__ == "__main__":
     monitor_thread.start()
     delivery_thread.start()
 
-    try:
-        while not stop_event.is_set():
-            stop_event.wait(1)
-    finally:
-        log.info("⏳ Waiting for threads to exit...")
-        monitor_thread.join()
-        delivery_thread.join()
-        log.info("👋 Scheduler stopped cleanly")
+    return monitor_thread, delivery_thread, stop_event
+

@@ -1,4 +1,4 @@
-# telegram/bot.py
+# tgram/handlers.py
 
 import os
 import re
@@ -11,6 +11,7 @@ from telegram.ext import (
     ContextTypes,
     MessageHandler,
     filters,
+    Application
 )
 
 from db.supabase_client import supabase
@@ -18,15 +19,7 @@ from db.supabase_client import supabase
 # ==========================
 # LOGGING
 # ==========================
-logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("telegram-bot")
-
-for lib in ("httpx", "httpcore", "postgrest", "supabase", "urllib3"):
-    logging.getLogger(lib).setLevel(logging.WARNING)
-
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
 
 # ==========================
 # IN-MEMORY STATE
@@ -66,17 +59,97 @@ async def reply_project_list(msg, title: str, projects: List[dict]):
         reply += f"{i}\\. {md_escape(p['name'])}\n"
     await msg.reply_text(reply, parse_mode="MarkdownV2")
 
+
+async def add_account_to_project(msg, ig_username: str, project: dict):
+    row = (
+        supabase.table("monitored_accounts")
+        .select("id, ig_username")
+        .eq("project_id", project["id"])
+        .single()
+        .execute()
+        .data
+    )
+
+    if not row:
+        supabase.table("monitored_accounts").insert({
+            "project_id": project["id"],
+            "ig_username": ig_username,
+            "is_active": True,
+        }).execute()
+    else:
+        existing = [u.strip() for u in row["ig_username"].split(",")]
+        if ig_username not in existing:
+            existing.append(ig_username)
+            supabase.table("monitored_accounts").update({
+                "ig_username": ", ".join(existing)
+            }).eq("id", row["id"]).execute()
+
+    await msg.reply_text(
+        f"✅ *@{md_escape(ig_username)}* added to *{md_escape(project['name'])}*",
+        parse_mode="MarkdownV2",
+    )
+
+
+async def start_user_removal(msg, telegram_user_id: str, project: dict):
+    rows = (
+        supabase.table("monitored_accounts")
+        .select("id, ig_username")
+        .eq("project_id", project["id"])
+        .execute()
+        .data or []
+    )
+
+    usernames = []
+    for r in rows:
+        for u in r["ig_username"].split(","):
+            usernames.append(u.strip())
+
+    if not usernames:
+        await msg.reply_text("ℹ️ No monitored accounts", parse_mode="MarkdownV2")
+        # Ensure we clear state if we were called from a flow
+        if telegram_user_id in PENDING:
+            del PENDING[telegram_user_id]
+        return
+
+    PENDING[telegram_user_id] = {
+        "stage": "remove_user",
+        "rows": rows,
+        "usernames": usernames,
+    }
+
+    reply = "Choose username to remove:\n\n"
+    for i, u in enumerate(usernames, 1):
+        reply += f"{i}\\. @{md_escape(u)}\n"
+
+    await msg.reply_text(reply, parse_mode="MarkdownV2")
+
 # ==========================
 # MAIN HANDLER
 # ==========================
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
+    if not msg:
+        return
+        
     telegram_user_id = str(msg.from_user.id)
     text = (msg.text or "").strip()
 
     # ==========================
     # COMMANDS
     # ==========================
+    if text == "/start":
+        await msg.reply_text(
+            "👋 *Instagram Analyzer Bot*\n\n"
+            "I can help you monitor Instagram accounts\\.\n\n"
+            "*Commands:*\n"
+            "• Send any `@username` or `instagram.com/user` to add it\n"
+            "• `/list` — View tracked accounts\n"
+            "• `/remove` — Remove an account\n"
+            "• `/cancel` — Stop current action",
+            parse_mode="MarkdownV2",
+        )
+        return
+
     if text == "/list":
         await handle_list(msg, telegram_user_id)
         return
@@ -134,37 +207,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("❌ Invalid selection", parse_mode="MarkdownV2")
             return
 
-        ig = state["ig"]
+        if telegram_user_id in PENDING:
+            del PENDING[telegram_user_id]
 
-        row = (
-            supabase.table("monitored_accounts")
-            .select("id, ig_username")
-            .eq("project_id", project["id"])
-            .single()
-            .execute()
-            .data
-        )
-
-        if not row:
-            supabase.table("monitored_accounts").insert({
-                "project_id": project["id"],
-                "ig_username": ig,
-                "is_active": True,
-            }).execute()
-        else:
-            existing = [u.strip() for u in row["ig_username"].split(",")]
-            if ig not in existing:
-                existing.append(ig)
-                supabase.table("monitored_accounts").update({
-                    "ig_username": ", ".join(existing)
-                }).eq("id", row["id"]).execute()
-
-        await msg.reply_text(
-            f"✅ *@{md_escape(ig)}* added to *{md_escape(project['name'])}*",
-            parse_mode="MarkdownV2",
-        )
-
-        del PENDING[telegram_user_id]
+        await add_account_to_project(msg, state["ig"], project)
         return
 
     # ==========================
@@ -179,33 +225,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("❌ Invalid selection", parse_mode="MarkdownV2")
             return
 
-        rows = (
-            supabase.table("monitored_accounts")
-            .select("id, ig_username")
-            .eq("project_id", project["id"])
-            .execute()
-            .data or []
-        )
-
-        usernames = []
-        for r in rows:
-            for u in r["ig_username"].split(","):
-                usernames.append(u.strip())
-
-        if not usernames:
-            await msg.reply_text("ℹ️ No monitored accounts", parse_mode="MarkdownV2")
-            del PENDING[telegram_user_id]
-            return
-
-        state["stage"] = "remove_user"
-        state["rows"] = rows
-        state["usernames"] = usernames
-
-        reply = "Choose username to remove:\n\n"
-        for i, u in enumerate(usernames, 1):
-            reply += f"{i}\\. @{md_escape(u)}\n"
-
-        await msg.reply_text(reply, parse_mode="MarkdownV2")
+        await start_user_removal(msg, telegram_user_id, project)
         return
 
     # ==========================
@@ -302,6 +322,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # SINGLE ACCOUNT
+    # If only 1 project, skip selection and add directly
+    if len(accounts[0]["projects"]) == 1:
+        project = accounts[0]["projects"][0]
+        await add_account_to_project(msg, ig_username, project)
+        return
+
     PENDING[telegram_user_id] = {
         "stage": "add_project",
         "ig": ig_username,
@@ -394,6 +420,11 @@ async def handle_remove_start(msg, telegram_user_id: str):
         await msg.reply_text("❌ No projects found", parse_mode="MarkdownV2")
         return
 
+    # If only 1 project, skip selection
+    if len(projects) == 1:
+        await start_user_removal(msg, telegram_user_id, projects[0])
+        return
+
     PENDING[telegram_user_id] = {
         "stage": "remove_project",
         "projects": projects,
@@ -408,15 +439,14 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled exception", exc_info=context.error)
 
 # ==========================
-# START BOT
+# BUILDER
 # ==========================
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+def setup_bot() -> Application:
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
+        
+    app = ApplicationBuilder().token(token).build()
     app.add_handler(MessageHandler(filters.TEXT, on_message))
     app.add_error_handler(on_error)
-
-    log.info("🤖 Telegram bot started")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+    return app

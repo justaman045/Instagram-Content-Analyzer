@@ -100,9 +100,18 @@ def should_insert_snapshot(project_id: str, reel_url: str, reel: Dict) -> bool:
     dl = reel["likes"] - last["likes"]
     dc = reel["comments"] - last["comments"]
 
+    # 1. Capture significant delta
     if dv >= MIN_VIEW_DELTA or dl > 0 or dc > 0:
         return True
 
+    # 2. Adaptive: If moving fast (> 50 VPH), capture at least hourly
+    # (Even if delta < MIN_VIEW_DELTA, which is rare, but safe fallback)
+    hours = max(mins_since / 60, 0.01)
+    vph = dv / hours
+    if vph > 50 and mins_since >= 60:
+        return True
+
+    # 3. Fallback: Catch-up every 6 hours
     if mins_since >= 360:
         return True
 
@@ -219,25 +228,79 @@ def run_monitor(project_id: Optional[str] = None):
         pid = project["id"]
         log.info(f"📁 Project: {project['name']}")
 
+        # 1. Fetch ALL monitored accounts (Metadata is small, ~5000 rows = ~500KB, fine to fetch)
         rows = (
             supabase.table("monitored_accounts")
-            .select("ig_username")
+            .select("id, ig_username, last_checked_at, check_frequency, priority_score")
             .eq("project_id", pid)
+            .eq("is_active", True)
             .execute()
             .data or []
         )
 
-        usernames = normalize_usernames(rows)
-        random.shuffle(usernames)
+        if not rows:
+            log.info("ℹ️ No active accounts.")
+            continue
 
+        # 2. Filter: Who needs checking?
+        # Criteria: now > last_checked + frequency
+        queue = []
+        now = now_utc()
+        
+        for r in rows:
+            # Parse last_checked (handle None as 'Never')
+            if r.get("last_checked_at"):
+                last_check = parse_ts(r["last_checked_at"])
+            else:
+                last_check = datetime.min.replace(tzinfo=timezone.utc)
+            
+            # Default freq 6h if missing
+            freq_hours = r.get("check_frequency") or 6
+            next_check = last_check + timedelta(hours=freq_hours)
+            
+            if now >= next_check:
+                # Add to queue
+                priority = r.get("priority_score") or 1.0
+                queue.append({
+                    "row_id": r["id"],
+                    "username": r.get("ig_username", "").strip().lstrip("@"),
+                    "score": priority,
+                    "overdue_by": (now - next_check).total_seconds()
+                })
+
+        # 3. Sort Queue
+        # Primary: Priority Score (Desc), Secondary: Overdue Amount (Desc)
+        queue.sort(key=lambda x: (x["score"], x["overdue_by"]), reverse=True)
+
+        log.info(f"📊 Queue status: {len(queue)} pending / {len(rows)} total")
+
+        # 4. Cap Batch Size (Human-Like Safety)
+        # To fetch 50 users with ~60s delays takes ~50 minutes.
+        # This fits the GHA timeout of 60m.
+        SAFE_BATCH_LIMIT = 50
+        batch = queue[:SAFE_BATCH_LIMIT]
+        
+        if not batch:
+            log.info(f"✅ All accounts are up to date (Queue: {len(queue)})")
+            continue
+            
+        usernames = [x["username"] for x in batch]
+        
         seen_reels_this_run: Set[str] = set()
-        batch_count = 0
+        requests_count = 0
 
-        for username in usernames:
+        for i, username in enumerate(usernames):
+            # 5. Human-Like Delays
+            # Sleep SIGNIFICANTLY between profiles.
+            # 30s to 90s is safe for "browsing".
+            if i > 0:
+                sleep_time = random.uniform(30, 90)
+                log.info(f"☕ " + f"Reading content... ({sleep_time:.0f}s delay)")
+                time.sleep(sleep_time)
+
             if requests_this_run >= MAX_REQUESTS_PER_HOUR:
-                cooldown = random.uniform(*SESSION_COOLDOWN_RANGE)
-                log.warning(f"🛑 Hour cap hit — sleeping {cooldown:.0f}s")
-                time.sleep(cooldown)
+                # ... existing break logic ...
+                log.warning(f"🛑 Hour cap hit")
                 blocked = True
                 break
 
@@ -256,7 +319,15 @@ def run_monitor(project_id: Optional[str] = None):
                     time.sleep(60)
 
                 requests_this_run += 1
-                batch_count += 1
+                requests_count += 1
+                
+                # Mark as checked
+                # Find row_id from batch list (inefficient look up but list is small <200)
+                row_id = next((x["row_id"] for x in batch if x["username"] == username), None)
+                if row_id:
+                    supabase.table("monitored_accounts").update({
+                        "last_checked_at": now_utc().isoformat()
+                    }).eq("id", row_id).execute()
 
             except Exception:
                 log.exception(f"Fetch failed @{username}")
@@ -271,6 +342,7 @@ def run_monitor(project_id: Optional[str] = None):
                     {
                         "project_id": pid,
                         "reel_url": reel_url,
+                        "owner_handle": username, # Linked for Analyzer
                         "views": reel["views"],
                         "likes": reel["likes"],
                         "comments": reel["comments"],
@@ -297,12 +369,6 @@ def run_monitor(project_id: Optional[str] = None):
                     total_snaps += 1
 
                 trim_snapshots(pid, reel_url)
-
-            if batch_count >= BATCH_SIZE:
-                cooldown = random.uniform(*BATCH_COOLDOWN_RANGE)
-                log.info(f"😴 Batch cooldown {cooldown:.0f}s")
-                time.sleep(cooldown)
-                batch_count = 0
 
         if blocked:
             log.error("🚫 Instagram blocked — stopping safely")

@@ -1,0 +1,83 @@
+name: Project Workflow Template
+
+on:
+  schedule:
+    - cron: '30 */6 * * *'  # Runs every 6 hours (at minute 30)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Mode: "bot" (Interaction) or "analysis" (Core Logic)'
+        required: true
+        default: 'bot'
+        type: choice
+        options:
+        - bot
+        - analysis
+      runtime:
+        description: 'Bot Runtime (mins)'
+        required: false
+        default: '60'
+  repository_dispatch:
+    types: [trigger-bot]    # Trigger from Google Apps Script
+
+jobs:
+  # 1. ANALYSIS JOB (Runs on Schedule)
+  run-analysis:
+    if: github.event_name == 'schedule' || github.event.inputs.mode == 'analysis'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Core Analysis Batch
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          IG_USERNAME: ${{ secrets.IG_USERNAME }}
+          IG_PASSWORD: ${{ secrets.IG_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }} # Needed for Delivery
+          # Optional: Run ONLY this project. If undefined, runs ALL.
+          PROJECT_ID: ${{ secrets.PROJECT_ID }} 
+        run: |
+          python core_runner.py
+
+
+  # 2. BOT INTERACTION JOB (Runs on "Doorbell" Webhook or Manual)
+  run-bot:
+    if: github.event_name == 'repository_dispatch' || github.event.inputs.mode == 'bot' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Telegram Manager
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          # Runtime: Manual input OR Payload input OR Default 5 mins (Doorbell)
+          RUNTIME_MINUTES: ${{ github.event.inputs.runtime || github.event.client_payload.runtime || '5' }}
+        run: |
+          python bot.py
